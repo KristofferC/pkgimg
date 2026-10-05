@@ -133,13 +133,13 @@ fn read_section(c: &mut Cursor, align: usize) -> Result<(usize, usize)> {
 fn read_arraylist(c: &mut Cursor) -> Result<Vec<u64>> {
     let n = c.u64()? as usize;
     let b = c.take(n.checked_mul(8).context("bad list length")?)?;
-    Ok(b.chunks_exact(8).map(|x| u64::from_le_bytes(x.try_into().unwrap())).collect())
+    Ok(b.as_chunks::<8>().0.iter().map(|&x| u64::from_le_bytes(x)).collect())
 }
 
 fn read_u32s(c: &mut Cursor) -> Result<Vec<u32>> {
     let n = c.u32()? as usize;
     let b = c.take(n * 4)?;
-    Ok(b.chunks_exact(4).map(|x| u32::from_le_bytes(x.try_into().unwrap())).collect())
+    Ok(b.as_chunks::<4>().0.iter().map(|&x| u32::from_le_bytes(x)).collect())
 }
 
 impl Heap {
@@ -184,7 +184,7 @@ impl Heap {
         let fixup_objs = read_arraylist(&mut rc)?;
 
         let words = |s: usize, l: usize| -> Vec<u64> {
-            buf[s..s + l].chunks_exact(8).map(|x| u64::from_le_bytes(x.try_into().unwrap())).collect()
+            buf[s..s + l].as_chunks::<8>().0.iter().map(|&x| u64::from_le_bytes(x)).collect()
         };
         let gvar_record = words(gv_start, gv_len);
         let fptr_record = words(fp_start, fp_len);

@@ -47,15 +47,75 @@ pub fn load(l: app::Load) -> Result<model::Model> {
                 // Remaining native libraries: system images (embedded heap).
                 images.push(Image::from_bytes(name.into(), Blob::from_vec(bytes), None, None)?);
             }
-            let ti = images
-                .iter()
-                .position(|im| im.header.pkg.is_some())
-                .ok_or_else(|| anyhow::anyhow!("no package image (.ji) among the dropped files"))?;
+            let headers: Vec<_> = images.iter().map(|im| &im.header).collect();
+            let ti = dropped_target(&headers)
+                .ok_or_else(|| anyhow::anyhow!("no root package image (.ji) among the dropped files"))?;
             let target = images.swap_remove(ti);
             World::from_images(target, images)
         }
     };
     Ok(model::Model::build(w, web_time_now().saturating_sub(t0)))
+}
+
+/// Pick a package that is not required by another dropped package, preserving drop order.
+fn dropped_target(headers: &[&pkgimg_core::header::Header]) -> Option<usize> {
+    headers.iter().enumerate().position(|(i, header)| {
+        let Some(pkg) = &header.pkg else { return false };
+        !headers.iter().enumerate().any(|(j, other)| {
+            i != j && other.pkg.as_ref().is_some_and(|other| {
+                other.required_modules.iter().any(|dep| {
+                    pkg.worklist.iter().any(|module| {
+                        module.name == dep.name && module.uuid == dep.uuid
+                            && module.build_id_lo == dep.build_id_lo
+                            && (dep.build_id_hi == 0 || dep.build_id_hi == header.base.checksum)
+                    })
+                })
+            })
+        })
+    })
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+    use pkgimg_core::header::{self, ModuleId, PkgHeader};
+
+    fn package(name: &str, dependencies: &[&str]) -> header::Header {
+        let module = |name: &str| ModuleId {
+            name: name.into(), uuid: name.into(), build_id_hi: 0, build_id_lo: 1,
+        };
+        let mut h = header::raw_sysimage_header("Linux", "x86_64");
+        h.pkg = Some(PkgHeader {
+            cache_flags: header::CacheFlags {
+                raw: 0, use_pkgimages: true, debug_level: 0, check_bounds: 0,
+                inline: true, opt_level: 2,
+            },
+            coverage: 0, syntax_version: 0, worklist: vec![module(name)],
+            includes: vec![], requires: vec![], preferences: String::new(), srctext_pos: 0,
+            required_modules: dependencies.iter().map(|name| module(name)).collect(),
+            clone_targets: vec![],
+        });
+        h
+    }
+
+    #[test]
+    fn dropped_package_selection_uses_dependency_graph() {
+        let dependency = package("Dependency", &[]);
+        let intermediate = package("Intermediate", &["Dependency"]);
+        let target = package("Target", &["Intermediate"]);
+        let sys = header::raw_sysimage_header("Linux", "x86_64");
+        assert_eq!(dropped_target(&[&sys, &dependency, &intermediate, &target]), Some(3));
+        assert_eq!(dropped_target(&[&target, &dependency]), Some(0));
+        assert_eq!(dropped_target(&[&sys]), None);
+    }
+
+    #[test]
+    fn different_dependency_build_does_not_hide_package() {
+        let mut dependency = package("Dependency", &[]);
+        let target = package("Target", &["Dependency"]);
+        dependency.pkg.as_mut().unwrap().worklist[0].build_id_lo = 2;
+        assert_eq!(dropped_target(&[&dependency, &target]), Some(0));
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -66,15 +66,15 @@ impl<'a> Cursor<'a> {
 
 #[inline]
 pub fn rd_u64(buf: &[u8], off: usize) -> u64 {
-    buf.get(off..off + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
+    buf.get(off..).and_then(|b| b.get(..8)).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
 }
 #[inline]
 pub fn rd_u32(buf: &[u8], off: usize) -> u32 {
-    buf.get(off..off + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+    buf.get(off..).and_then(|b| b.get(..4)).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
 }
 #[inline]
 pub fn rd_u16(buf: &[u8], off: usize) -> u16 {
-    buf.get(off..off + 2).map_or(0, |b| u16::from_le_bytes(b.try_into().unwrap()))
+    buf.get(off..).and_then(|b| b.get(..2)).map_or(0, |b| u16::from_le_bytes(b.try_into().unwrap()))
 }
 
 /// Decode a 0-terminated list of LEB128-style deltas (`jl_write_offsetlist`). Lists are not
@@ -89,7 +89,7 @@ pub fn read_offsetlist(buf: &[u8], pos: &mut usize) -> Result<Vec<u32>> {
         loop {
             let Some(&c) = buf.get(*pos) else { bail!("truncated offset list") };
             *pos += 1;
-            if shift >= 64 {
+            if shift >= 64 || (shift == 63 && c & 0x7f > 1) {
                 bail!("corrupt offset list");
             }
             d |= ((c & 0x7f) as u64) << shift;
@@ -103,5 +103,41 @@ pub fn read_offsetlist(buf: &[u8], pos: &mut usize) -> Result<Vec<u32>> {
         }
         last = last.wrapping_add(d);
         out.push(u32::try_from(last).context("corrupt offset list")?);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_width_reads_handle_invalid_offsets() {
+        let bytes = [1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(rd_u64(&bytes, 0), 0x0807060504030201);
+        assert_eq!(rd_u32(&bytes, 4), 0x08070605);
+        assert_eq!(rd_u16(&bytes, 6), 0x0807);
+        for offset in [8, usize::MAX - 1, usize::MAX] {
+            assert_eq!(rd_u64(&bytes, offset), 0);
+            assert_eq!(rd_u32(&bytes, offset), 0);
+            assert_eq!(rd_u16(&bytes, offset), 0);
+        }
+        assert_eq!(rd_u64(&bytes, 1), 0);
+    }
+
+    #[test]
+    fn offset_lists_preserve_backwards_steps() {
+        // 16, then -8 encoded as a wrapped u64, then the terminator.
+        let bytes = [16, 0xf8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 0];
+        assert_eq!(read_offsetlist(&bytes, &mut 0).unwrap(), vec![16, 8]);
+    }
+
+    #[test]
+    fn offset_lists_reject_overflow_and_truncation() {
+        // The tenth byte used to discard overflowing bits and decode as zero.
+        let mut bytes = vec![0x80; 9];
+        bytes.push(2);
+        assert!(read_offsetlist(&bytes, &mut 0).is_err());
+        assert!(read_offsetlist(&[0x80], &mut 0).is_err());
+        assert!(read_offsetlist(&[1], &mut 0).is_err());
     }
 }

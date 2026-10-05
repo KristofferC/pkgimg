@@ -5,7 +5,7 @@ It reads the files directly, so no Julia process is needed, and it resolves refe
 into the system image and dependency caches to name every type, method and specialization.
 
 - `pkgimg`: CLI with text or JSON output, for humans, scripts and agents
-- `pkgimg-gui`: egui desktop app (a web build is planned; the core already compiles for wasm)
+- `pkgimg-gui`: egui desktop app and browser build
 
 Supported formats: Julia master (image format v16) and 1.13 (v12), 64-bit.
 
@@ -35,9 +35,19 @@ in `$JULIA_DEPOT_PATH` / `~/.julia` and the stdlib cache directory by uuid and b
 
 ### For agents
 
-Every command supports `--json`. The output has a `schema` field, totals, `total_rows` and
-`truncated`, and keys that stay stable across builds (signatures with gensym counters
-removed in `diff`). A typical loop to reduce compiled code:
+Every command supports `--json`. Successful JSON responses include `schema: "pkgimg/1"`.
+Table responses include `total_rows` and `truncated`; `-n 0` returns all rows. Summary uses
+these fields for `top_types`. Diff reports truncation for each of its three tables and
+a combined `truncated` flag. Signatures have gensym counters removed in `diff` to make
+comparisons more stable across builds.
+
+Check `image.resolution.complete` before relying on decoded names. The same object
+includes the resolved system-image path and `missing_dependencies`. Warnings go to
+stderr. Ungrouped `compiled` and `methods` rows include `offset` and `const`, which can
+be passed to `show` (`--const` when true) or used to select a code instance with `why`.
+`sources --show FILE --json` returns source text and its path in a JSON object.
+
+A typical loop to reduce compiled code:
 
 1. `pkgimg compiled X.ji --by method --json`: which methods have the most specializations
    and native code
@@ -62,7 +72,21 @@ cargo run --release -p pkgimg-gui -- path/to/cache.ji
 Files can also be dropped onto the window. Tabs: overview, heap histogram, objects, code
 instances, methods, embedded sources (with per-line method markers) and dependencies. The
 inspector decodes any object and links to its fields across images; use alt+←/→ to go
-back and forward.
+back and forward. The overview cards link to heap, compiled code and methods. Use
+Ctrl+O to return to the cache browser, Enter to open its first matching result, and
+Copy path to reuse the current image in CLI commands. Opening another image resets
+its filters and selections.
+
+To build the browser version (requires the `wasm32-unknown-unknown` target and a
+`wasm-bindgen` CLI matching the locked dependency):
+
+```
+sh crates/pkgimg-gui/build-web.sh
+```
+
+Serve `crates/pkgimg-gui/web/` with a static HTTP server. Drop the package `.ji` and
+native library together with its system image and dependency files. The browser
+selects a package that is not a dependency of another dropped package.
 
 Screenshots of every tab are rendered offscreen with:
 
@@ -79,3 +103,17 @@ lists (one type tag per object, plus every pointer slot), and the tables linking
 instances to the native code in the shared library (`fptr_record`, `jl_image_pointers`).
 Objects are decoded generically through the type layouts that are themselves serialized
 in the images. Only a few C struct offsets (DataType, TypeName, Module) are hard-coded.
+
+## Validation
+
+```
+cargo test --workspace
+PKGIMG_TEST_IMAGES=/path/to/package.ji cargo test -p pkgimg-core --test smoke
+PKGIMG_SWEEP_MAX=25 cargo test -p pkgimg-core --test sweep -- --ignored --nocapture
+```
+
+The ordinary tests include synthetic parser, CLI JSON and GUI state regressions.
+The smoke test needs a real image and a matching system image; without the environment
+variable it skips its checks. The optional sweep samples local caches and accepts
+unsupported-format errors, but fails on panics. `PKGIMG_SWEEP_MAXSIZE` limits every
+input file, including native libraries (default 30 MiB).

@@ -38,11 +38,14 @@ fn sweep() {
     // Spread over Julia versions and locations: every k-th file.
     let mut files: Vec<_> = d.caches.iter().filter(|c| c.ji_size <= maxsize).collect();
     files.sort_by(|a, b| (&a.julia, &a.package, &a.ji).cmp(&(&b.julia, &b.package, &b.ji)));
-    let k = (files.len() / max).max(1);
-    let mut picked: Vec<std::path::PathBuf> = files.iter().step_by(k).map(|c| c.ji.clone()).collect();
+    let max = if max == 0 { files.len().max(1) } else { max };
+    let k = files.len().div_ceil(max).max(1);
+    let mut picked: Vec<std::path::PathBuf> = files.iter().step_by(k).take(max).map(|c| c.ji.clone()).collect();
     // Also native libraries directly, and system images.
     picked.extend(files.iter().step_by(k * 7).filter_map(|c| c.native.clone()));
     picked.extend(d.roots.iter().filter_map(|r| r.sysimage.clone()).take(4));
+    // Apply the size limit to native libraries and system images too.
+    picked.retain(|p| p.metadata().is_ok_and(|m| m.len() <= maxsize));
     let (mut ok, mut err, mut panics) = (0, 0, vec![]);
     for p in &picked {
         match catch_unwind(AssertUnwindSafe(|| exercise(p))) {

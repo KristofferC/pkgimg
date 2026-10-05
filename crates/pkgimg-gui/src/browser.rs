@@ -116,8 +116,8 @@ impl Browser {
         self.focus_filter = true;
     }
 
-    fn summary(&mut self, p: &PathBuf) -> Option<&HeaderSummary> {
-        self.summaries.entry(p.clone()).or_insert_with(|| discover::read_summary(p)).as_ref()
+    fn summary(&mut self, p: &std::path::Path) -> Option<&HeaderSummary> {
+        self.summaries.entry(p.to_path_buf()).or_insert_with(|| discover::read_summary(p)).as_ref()
     }
 
     /// Sysimage hint for a path: the install it lives under, if any.
@@ -130,11 +130,21 @@ impl Browser {
         if let Some(rx) = &self.scan
             && let Ok(d) = rx.try_recv()
         {
+            // Root indices and cached headers may change after a rescan.
+            self.root = self.root.and_then(|index| {
+                let path = &self.disc.as_ref()?.roots.get(index)?.path;
+                d.roots.iter().position(|r| &r.path == path)
+            });
+            self.summaries.clear();
             self.disc = Some(d);
             self.scan = None;
             self.order_key.clear();
         }
+        if self.scan.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
         let mut pick = None;
+        let mut open_first = false;
         ui.horizontal(|ui| {
             ui.heading("Open a cache file");
             if self.scan.is_some() {
@@ -155,10 +165,7 @@ impl Browser {
             }
             // Enter opens the first match
             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if let (Some(&i), Some(d)) = (self.order.first(), &self.disc) {
-                    let c = &d.caches[i];
-                    pick = Some(Pick { ji: c.ji.clone(), sysimage: discover::sysimage_for(d, c) });
-                }
+                open_first = true;
             }
             ui.separator();
             ui.label("Julia");
@@ -264,6 +271,19 @@ impl Browser {
             self.order = order;
             self.order_key = key;
         }
+        if open_first && let Some(&i) = self.order.first() {
+            let c = &d.caches[i];
+            pick = Some(Pick { ji: c.ji.clone(), sysimage: discover::sysimage_for(&d, c) });
+        }
+        ui.label(RichText::new(format!("{} of {} cache files · click a row to open · Enter opens the first match", self.order.len(), d.caches.len())).weak());
+        if self.order.is_empty() {
+            ui.label("No matching cache files. Try another package name, clear filters, or add a cache folder.");
+            if ui.button("Clear filters").clicked() {
+                self.filter.clear();
+                self.julia = None;
+                self.root = None;
+            }
+        }
         let order = self.order.clone();
         let (mut sc, mut sd) = (self.sort_col, self.sort_desc);
         let mut header = |ui: &mut Ui, label: &str, i: usize, desc: bool| {
@@ -309,7 +329,7 @@ impl Browser {
                             if !s.supported {
                                 return format!("{} (format v{}, not supported)", s.julia_version, s.format_version);
                             }
-                            let commit = s.git_commit.as_deref().map(|c| &c[..c.len().min(10)]).unwrap_or("");
+                            let commit = s.git_commit.as_deref().map(|c| c.chars().take(10).collect::<String>()).unwrap_or_default();
                             format!("{} {}", s.julia_version, commit)
                         });
                         ui.label(RichText::new(s.unwrap_or_else(|| "unreadable".into())).weak());

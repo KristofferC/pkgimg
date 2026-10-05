@@ -201,11 +201,28 @@ impl App {
         #[cfg(target_arch = "wasm32")]
         job();
         self.state = State::Loading(rx, label);
+    }
+
+    /// Clear all state tied to a particular model before displaying a replacement.
+    fn reset_image_view(&mut self) {
+        self.tab = Tab::Overview;
         self.history.clear();
         self.hist_pos = 0;
         self.referrers = None;
+        self.obj_exact = None;
+        self.ci_group_sel = None;
+        self.ci_group = CiGroup::None;
+        self.ci_group_rows.clear();
+        self.src_sel = 0;
+        self.src_scroll_line = None;
+        self.heap_filter.clear();
+        self.obj_filter.clear();
+        self.ci_filter.clear();
+        self.m_filter.clear();
+        self.show_browser = false;
         for s in [&mut self.heap_sort, &mut self.obj_rows, &mut self.ci_sort, &mut self.m_sort, &mut self.ci_groups] {
             s.key.clear();
+            s.order.clear();
         }
     }
 
@@ -325,13 +342,19 @@ impl eframe::App for App {
                 self.hist_pos = 0;
             }
         }
-        if let State::Loading(rx, _) = &self.state
-            && let Ok(r) = rx.try_recv()
-        {
-            self.state = match r {
-                Ok(m) => State::Ready(Box::new(m)),
-                Err(e) => State::Failed(e),
+        if let State::Loading(rx, _) = &self.state {
+            let result = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err("The image loader stopped unexpectedly. Try opening another image.".into())),
             };
+            if let Some(result) = result {
+                self.reset_image_view();
+                self.state = match result {
+                    Ok(m) => State::Ready(Box::new(m)),
+                    Err(e) => State::Failed(e),
+                };
+            }
         }
         // Back/forward with mouse buttons or alt+arrows
         let (back, fwd) = ctx.input(|i| {
@@ -362,7 +385,11 @@ impl eframe::App for App {
                 if let State::Ready(m) = &self.state {
                     let im = m.w.target();
                     ui.label(RichText::new(im.display_name()).strong());
-                    ui.label(RichText::new(format!("{}  ·  Julia {}  ·  loaded in {:.0?}", im.path.display(), im.header.base.julia_version, m.load_time)).weak());
+                    ui.add(egui::Label::new(RichText::new(format!("Julia {}  ·  loaded in {:.0?}", im.header.base.julia_version, m.load_time)).weak()))
+                        .on_hover_text(im.path.display().to_string());
+                    if ui.small_button("Copy path").on_hover_text(im.path.display().to_string()).clicked() {
+                        ui.ctx().copy_text(im.path.display().to_string());
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::widgets::global_theme_preference_switch(ui);
@@ -413,7 +440,11 @@ impl eframe::App for App {
             let mut pick = None;
             egui::CentralPanel::default().show(ui, |ui| {
                 if let State::Failed(e) = &self.state {
+                    ui.heading("Could not open image");
                     ui.colored_label(ui.visuals().error_fg_color, e);
+                    if ui.button("Copy error").clicked() { ui.ctx().copy_text(e.clone()); }
+                    ui.label("Choose another cache below. Supported images: Julia 1.13 and master, 64-bit.");
+                    ui.separator();
                 }
                 pick = self.browser.ui(ui);
             });
@@ -459,7 +490,9 @@ impl App {
             match s {
                 State::Loading(_, label) => {
                     ui.spinner();
-                    ui.label(format!("Loading {label} …"));
+                    ui.heading("Reading image");
+                    ui.label(label);
+                    ui.label(RichText::new("Resolving dependencies and computing heap and code statistics…").weak());
                     return;
                 }
                 State::Failed(e) => {
@@ -493,6 +526,26 @@ impl App {
         let im = m.w.target();
         let st = &m.stats;
         egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("At a glance");
+            ui.label(RichText::new("Explore what occupies this image and where compiled code comes from.").weak());
+            ui.add_space(8.0);
+            ui.columns(3, |cols| {
+                for (i, (title, value, hint, tab)) in [
+                    ("Serialized heap", human(im.heap.data.len() as u64), "Uncompressed serialized heap", Tab::Heap),
+                    ("Native code", human(st.native_bytes), "Attributed to code instances, including wrappers", Tab::Compiled),
+                    ("Method definitions", st.n_methods.to_string(), "Method definitions in this image", Tab::Methods),
+                ].into_iter().enumerate() {
+                    let ui = &mut cols[i];
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.label(RichText::new(title).weak());
+                        ui.label(RichText::new(value).size(25.0).strong().color(bar_color(ui)));
+                        ui.label(RichText::new(hint).small().weak());
+                        if ui.link(format!("Explore {title}")).clicked() { self.tab = tab; }
+                    });
+                }
+            });
+            ui.add_space(12.0);
             ui.columns(2, |cols| {
                 let ui = &mut cols[0];
                 ui.heading("Image");
@@ -513,11 +566,14 @@ impl App {
                         row("include files", p.includes.len().to_string());
                     }
                     row(".ji size", human(im.ji.len() as u64));
+                    row("heap on disk", human(im.heap_stored_size as u64));
+                    row("embedded sources", m.srctext.len().to_string());
+                    row("provenance", m.provenance_path.clone().unwrap_or_else(|| "Not available — root/caller attribution needs a sidecar".into()));
                     if let Some(n) = &im.native {
                         row("native size", format!("{}  (.text {})", human(n.file_size), human(n.text_size)));
                         row("native functions", n.fvars.len().to_string());
                     }
-                    row("objects", format!("{} + {} const", m.objs.len(), m.cst.len()));
+                    row("objects", format!("{} + {} const", m.objs.len(), m.cst.iter().filter(|e| e.label != pkgimg_core::analysis::ConstLabel::MemData).count()));
                     row("methods", st.n_methods.to_string());
                     row("method instances", st.n_mi.to_string());
                     row("code instances", format!("{}  ({} native, {} external, {} dead)", m.cis.len(), st.native_cis, st.ext_cis, st.dead_cis));
@@ -559,6 +615,7 @@ impl App {
             });
             ui.add_space(12.0);
             ui.heading("Largest types");
+            ui.label(RichText::new("Click a type to inspect its objects. Sizes include alignment padding.").weak());
             let max = rows.first().map_or(1, |r| r.bytes).max(1);
             let color = bar_color(ui);
             let mut clicked = None;
@@ -626,7 +683,12 @@ impl App {
         }
         let total: u64 = rows.iter().map(|r| r.bytes).sum::<u64>().max(1);
         let max = rows.iter().map(|r| r.bytes).max().unwrap_or(1).max(1);
-        ui.label(RichText::new(format!("{} groups, {} total", self.heap_sort.order.len(), human(total))).weak());
+        let matched: u64 = self.heap_sort.order.iter().map(|&i| rows[i].bytes).sum();
+        ui.label(RichText::new(format!("{} of {} groups · {} shown / {} total", self.heap_sort.order.len(), rows.len(), human(matched), human(rows.iter().map(|r| r.bytes).sum()))).weak());
+        if self.heap_sort.order.is_empty() {
+            ui.label("No matching types. Clear the filter or choose another section.");
+            if ui.button("Clear filter").clicked() { self.heap_filter.clear(); }
+        }
         let color = bar_color(ui);
         let mut clicked = None;
         let mut sort = std::mem::take(&mut self.heap_sort);
@@ -1298,5 +1360,43 @@ mod web {
         }
         let buf = JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?).await.map_err(|e| format!("{e:?}"))?;
         Ok(js_sys::Uint8Array::new(&buf).to_vec())
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_load_clears_previous_image_selection() {
+        let mut harness = egui_kittest::Harness::builder().build_eframe(|cc| App::new(cc, None));
+        let (tx, rx) = mpsc::channel();
+        let app = harness.state_mut();
+        app.obj_exact = Some(u32::MAX);
+        app.ci_group_sel = Some("old method".into());
+        app.obj_rows.order = vec![usize::MAX];
+        app.src_sel = 100;
+        app.history.push(Obj { img: 10, off: 128, cst: false });
+        app.hist_pos = 1;
+        app.state = State::Loading(rx, "new image".into());
+        tx.send(Err("test load failure".into())).unwrap();
+        harness.step();
+        let app = harness.state();
+        assert!(matches!(app.state, State::Failed(_)));
+        assert!(app.obj_exact.is_none());
+        assert!(app.obj_rows.order.is_empty());
+        assert!(app.ci_group_sel.is_none());
+        assert!(app.history.is_empty());
+        assert_eq!(app.src_sel, 0);
+    }
+
+    #[test]
+    fn disconnected_loader_displays_failure() {
+        let mut harness = egui_kittest::Harness::builder().build_eframe(|cc| App::new(cc, None));
+        let (tx, rx) = mpsc::channel();
+        harness.state_mut().state = State::Loading(rx, "image".into());
+        drop(tx);
+        harness.step();
+        assert!(matches!(&harness.state().state, State::Failed(e) if e.contains("stopped unexpectedly")));
     }
 }

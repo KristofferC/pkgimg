@@ -155,8 +155,12 @@ struct Ctx {
 }
 
 impl Ctx {
+    fn row_count(&self, total: usize) -> usize {
+        if self.limit == 0 { total } else { total.min(self.limit) }
+    }
+
     fn rows<T: Serialize>(&self, cmd: &str, image: Value, rows: &[T], cols: &[(&str, &str)], extra: Value) {
-        let n = if self.limit == 0 { rows.len() } else { rows.len().min(self.limit) };
+        let n = self.row_count(rows.len());
         if self.json {
             let mut v = json!({
                 "schema": "pkgimg/1",
@@ -231,6 +235,11 @@ fn image_id(w: &World) -> Value {
         "native_path": im.native_path,
         "modules": h.pkg.as_ref().map(|p| p.worklist.iter().map(|m| &m.name).collect::<Vec<_>>()),
         "julia_version": h.base.julia_version,
+        "resolution": {
+            "complete": w.sysimg.is_some() && w.missing.is_empty(),
+            "sysimage": w.sysimg.map(|id| &w.img(id).path),
+            "missing_dependencies": w.missing,
+        },
     })
 }
 
@@ -295,6 +304,7 @@ fn main() -> Result<()> {
             let (objs, _) = tables(&w);
             let mut rows = analysis::methods(&w, w.target, &objs);
             rows.sort_by(|a, b| (&a.module, &a.name, &a.file, a.line).cmp(&(&b.module, &b.name, &b.file, b.line)));
+            let rows: Vec<Value> = rows.iter().map(|r| located_row(r, r.obj)).collect();
             ctx.rows("methods", image_id(&w), &rows, &[("module", "module"), ("name", "name"), ("sig", "signature"), ("file", "file"), ("line", "line")], json!({}));
         }
         Cmd::Deps { .. } => deps(&ctx, &w),
@@ -319,6 +329,12 @@ fn main() -> Result<()> {
             let src = w.target().srctext();
             if let Some(s) = show {
                 match src.iter().find(|(p, _)| p.ends_with(&s)) {
+                    Some((path, t)) if ctx.json => {
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "schema": "pkgimg/1", "command": "sources", "image": image_id(&w),
+                            "path": path, "text": t, "bytes": t.len(), "lines": t.lines().count(),
+                        }))?);
+                    }
                     Some((_, t)) => print!("{t}"),
                     None => anyhow::bail!("no embedded source matching {s}"),
                 }
@@ -386,7 +402,9 @@ fn summary(ctx: &Ctx, w: &World) {
             "native_code_for_code_instances": native_bytes,
             "compressed_inferred_ir": inferred_bytes,
         },
-        "top_types": &top[..top.len().min(ctx.limit.max(1))],
+        "total_rows": top.len(),
+        "truncated": ctx.row_count(top.len()) < top.len(),
+        "top_types": &top[..ctx.row_count(top.len())],
     });
     if ctx.json {
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
@@ -418,7 +436,7 @@ fn summary(ctx: &Ctx, w: &World) {
         println!("  unresolved dependencies: {}", w.missing.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", "));
     }
     println!("largest types");
-    let vals: Vec<Value> = top.iter().take(ctx.limit.clamp(1, 15)).map(|r| serde_json::to_value(r).unwrap()).collect();
+    let vals: Vec<Value> = top.iter().take(ctx.row_count(top.len())).map(|r| serde_json::to_value(r).unwrap()).collect();
     print_table(&vals, &[("bytes", "bytes"), ("count", "count"), ("key", "type")]);
 }
 
@@ -489,19 +507,17 @@ fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>
         CiSort::InferTime => b.infer_self_ms.total_cmp(&a.infer_self_ms),
         CiSort::Name => (&a.module, &a.method).cmp(&(&b.module, &b.method)),
     });
-    #[derive(Serialize)]
-    struct Shown<'a> {
-        #[serde(flatten)]
-        r: &'a CiRow,
-        func: String,
-    }
-    let shown: Vec<Shown> = rows.iter().map(|r| Shown { r, func: format!("{}.{}{}", r.module, r.method, r.spec) }).collect();
+    let shown: Vec<Value> = rows.iter().map(|r| {
+        let mut value = located_row(r, r.obj);
+        value["func"] = json!(format!("{}.{}{}", r.module, r.method, r.spec));
+        value
+    }).collect();
     ctx.rows("compiled", image_id(w), &shown, &[("native_bytes", "native"), ("inferred_bytes", "inferred"), ("infer_self_ms", "infer ms"), ("status", "status"), ("invoke", "invoke"), ("func", "specialization")], extra);
 }
 
 fn deps(ctx: &Ctx, w: &World) {
     let Some(p) = &w.target().header.pkg else {
-        println!("system image: no dependencies");
+        ctx.rows::<Value>("deps", image_id(w), &[], &[("name", "module"), ("location", "location")], json!({}));
         return;
     };
     let rows: Vec<Value> = p
@@ -641,7 +657,7 @@ fn diff(ctx: &Ctx, a: &World, b: &World) -> Result<()> {
         "code_instances_added": cis.iter().filter(|c| c.change == "added").count(),
         "code_instances_removed": cis.iter().filter(|c| c.change == "removed").count(),
     });
-    let lim = |n: usize| if ctx.limit == 0 { n } else { n.min(ctx.limit) };
+    let lim = |n| ctx.row_count(n);
     if ctx.json {
         let v = json!({
             "schema": "pkgimg/1", "command": "diff",
@@ -649,6 +665,11 @@ fn diff(ctx: &Ctx, a: &World, b: &World) -> Result<()> {
             "methods": &methods[..lim(methods.len())], "methods_total": methods.len(),
             "code_instances": &cis[..lim(cis.len())], "code_instances_total": cis.len(),
             "types": &types[..lim(types.len())], "types_total": types.len(),
+            "total_rows": methods.len() + cis.len() + types.len(),
+            "truncated": ([methods.len(), cis.len(), types.len()].iter().any(|&n| lim(n) < n)),
+            "methods_truncated": lim(methods.len()) < methods.len(),
+            "code_instances_truncated": lim(cis.len()) < cis.len(),
+            "types_truncated": lim(types.len()) < types.len(),
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(());
@@ -668,6 +689,13 @@ fn diff(ctx: &Ctx, a: &World, b: &World) -> Result<()> {
     let rows: Vec<Value> = types[..lim(types.len())].iter().map(|c| serde_json::to_value(c).unwrap()).collect();
     print_table(&rows, &[("delta_bytes", "delta"), ("a_bytes", "a"), ("b_bytes", "b"), ("key", "type")]);
     Ok(())
+}
+
+fn located_row(row: &impl Serialize, obj: pkgimg_core::Obj) -> Value {
+    let mut value = serde_json::to_value(row).expect("serializable table row");
+    value["offset"] = json!(obj.off);
+    value["const"] = json!(obj.cst);
+    value
 }
 
 fn val_json(w: &World, v: pkgimg_core::Val) -> Value {
@@ -707,6 +735,7 @@ fn show(ctx: &Ctx, w: &World, o: pkgimg_core::Obj) {
     } else { vec![] };
     let v = json!({
         "schema": "pkgimg/1", "command": "show",
+        "image": image_id(w),
         "offset": o.off, "const": o.cst, "type": ty,
         "value": w.show(pkgimg_core::Val::Obj(o), 4),
         "string": inspect::string_value(w, o),
@@ -791,15 +820,15 @@ fn why(ctx: &Ctx, w: &World, what: &str, prov: Option<&std::path::Path>) -> Resu
 
 /// Accept a package name in place of a path: the most recently written cache for it that
 /// this reader supports, among all discovered depots and Julia installations.
-fn resolve_target(p: &PathBuf, depots: &[PathBuf]) -> Result<PathBuf> {
+fn resolve_target(p: &std::path::Path, depots: &[PathBuf]) -> Result<PathBuf> {
     use pkgimg_core::discover;
     if p.exists() || p.components().count() > 1 {
-        return Ok(p.clone());
+        return Ok(p.to_path_buf());
     }
     let name = p.to_string_lossy();
     let d = discover::discover(depots);
     let mut cands: Vec<&discover::CacheFile> = d.caches.iter().filter(|c| c.package == name).collect();
-    cands.sort_by(|a, b| b.modified.cmp(&a.modified));
+    cands.sort_by_key(|c| std::cmp::Reverse(c.modified));
     match cands.into_iter().find(|c| discover::read_summary(&c.ji).is_some_and(|s| s.supported)) {
         Some(c) => {
             eprintln!("using {}", c.ji.display());
@@ -820,7 +849,7 @@ fn list(ctx: &Ctx, filter: Option<&str>, julia: Option<&str>, dirs: &[PathBuf]) 
         .filter(|c| f.as_ref().is_none_or(|f| c.package.to_lowercase().contains(f)))
         .filter(|c| jv.as_ref().is_none_or(|j| &c.julia == j))
         .collect();
-    rows.sort_by(|a, b| b.modified.cmp(&a.modified));
+    rows.sort_by_key(|c| std::cmp::Reverse(c.modified));
     let now = std::time::SystemTime::now();
     let vals: Vec<Value> = rows
         .iter()
@@ -879,4 +908,26 @@ fn asm(ctx: &Ctx, w: &World, what: &str) -> Result<()> {
         println!("{a:8x}  {t}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_rows_include_inspectable_location() {
+        let obj = pkgimg_core::Obj { img: 0, off: 128, cst: true };
+        let value = located_row(&json!({"method": "f"}), obj);
+        assert_eq!(value, json!({"method": "f", "offset": 128, "const": true}));
+    }
+
+    #[test]
+    fn row_limits_include_zero_as_unlimited() {
+        for json in [false, true] {
+            assert_eq!(Ctx { json, limit: 0 }.row_count(100), 100);
+            assert_eq!(Ctx { json, limit: 20 }.row_count(100), 20);
+            assert_eq!(Ctx { json, limit: 20 }.row_count(3), 3);
+            assert_eq!(Ctx { json, limit: 0 }.row_count(0), 0);
+        }
+    }
 }
