@@ -221,6 +221,9 @@ pub struct CiRow {
     pub invoke: String,
     pub native_bytes: u64,
     pub native_symbol: Option<String>,
+    /// Address of the specialized function in the native library.
+    #[serde(skip)]
+    pub native_addr: Option<u64>,
     pub wrapper_bytes: u64,
     pub infer_self_ms: f32,
     pub infer_total_ms: f32,
@@ -317,12 +320,16 @@ pub fn code_instances(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<CiRow> {
             }
         };
         let (native_bytes, native_symbol) = sym(&spec_fn);
+        let native_addr = match (spec_fn.get(&ci.off), nat) {
+            (Some(&a), Some(n)) => n.func_at(a).map(|f| f.addr),
+            _ => None,
+        };
         let (wrapper_bytes, _) = sym(&wrap_fn);
         let ms = |name| w.field_u64(ci, name).map_or(0.0, |x| f16_to_f32(x as u16) * 1000.0);
         let rettype = w.field(ci, "rettype").map(|v| w.show(v, 3)).unwrap_or_default();
         out.push(CiRow {
             obj: ci, mi, parent: None, root: None, method, module, file, line, spec, owner, status, external_method: ext,
-            inferred_bytes, inferred, invoke, native_bytes, native_symbol, wrapper_bytes,
+            inferred_bytes, inferred, invoke, native_bytes, native_symbol, native_addr, wrapper_bytes,
             infer_self_ms: ms("time_infer_self"), infer_total_ms: ms("time_infer_total"), rettype,
         });
     }

@@ -18,6 +18,8 @@ pub struct Image {
     /// Size of the heap as stored on disk (compressed or not).
     pub heap_stored_size: usize,
     pub native: Option<NativeInfo>,
+    /// Bytes of the native library, for disassembly.
+    pub native_bytes: Option<Blob>,
 }
 
 pub const DLEXT: &str = if cfg!(target_os = "macos") { "dylib" } else if cfg!(windows) { "dll" } else { "so" };
@@ -70,7 +72,7 @@ impl Image {
         let data = maybe_decompress(emb.clone())?;
         let heap = Heap::parse(data, false, header.base.cache_align())?;
         let native = Some(native::parse(&bytes)?);
-        Ok(Image { path: path.clone(), native_path: Some(path), header, ji: emb, heap, heap_stored_size, native })
+        Ok(Image { path: path.clone(), native_path: Some(path), header, ji: emb, heap, heap_stored_size, native, native_bytes: Some(bytes) })
     }
 
     fn from_ji(path: PathBuf, ji: Blob, native_path: Option<PathBuf>, native_buf: Option<Blob>) -> Result<Image> {
@@ -93,11 +95,11 @@ impl Image {
         let heap_stored_size = stored.len();
         let data = maybe_decompress(stored)?;
         let heap = Heap::parse(data, header.base.is_pkgimage(), header.base.cache_align())?;
-        let native = match native_buf {
-            Some(n) => Some(native::parse(&n)?),
+        let native = match &native_buf {
+            Some(n) => Some(native::parse(n)?),
             None => None,
         };
-        Ok(Image { path, native_path, header, ji, heap, heap_stored_size, native })
+        Ok(Image { path, native_path, header, ji, heap, heap_stored_size, native, native_bytes: native_buf })
     }
 
     /// Open a `.ji`, a pkgimage native library, or a system image (`sys.so`).

@@ -1087,6 +1087,21 @@ impl App {
                     }
                 });
             }
+            if let Some(c) = m.cis.iter().find(|c| c.obj == o)
+                && let (Some(addr), Some(buf)) = (c.native_addr, w.target().native_bytes.as_ref())
+            {
+                egui::CollapsingHeader::new(format!("disassembly ({} bytes)", c.native_bytes)).id_salt(("asm", o.off)).show(ui, |ui| {
+                    match pkgimg_core::native::disassemble(buf, addr, c.native_bytes) {
+                        Ok(lines) => {
+                            let text: String = lines.iter().map(|(a, t)| format!("{a:8x}  {t}\n")).collect();
+                            ui.label(RichText::new(text).monospace().small());
+                        }
+                        Err(e) => {
+                            ui.label(e.to_string());
+                        }
+                    }
+                });
+            }
             let fields = inspect::fields(w, o);
             if !fields.is_empty() {
                 ui.add_space(6.0);

@@ -195,3 +195,46 @@ pub fn parse(buf: &[u8]) -> Result<NativeInfo> {
     info.fvars = fvars;
     Ok(info)
 }
+
+/// Disassemble `[addr, addr+size)` of a native library (x86-64 only for now): `(address, text)`.
+pub fn disassemble(buf: &[u8], addr: u64, size: u64) -> Result<Vec<(u64, String)>> {
+    use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter, SymbolResolver, SymbolResult};
+    let file = object::File::parse(buf)?;
+    if file.architecture() != object::Architecture::X86_64 {
+        bail!("disassembly is only implemented for x86-64 (this is {:?})", file.architecture());
+    }
+    let mem = Mem::new(&file);
+    let code = mem.bytes(addr, size).context("function bytes not in a file-backed section")?;
+    // Name call/jump targets after the symbols they land in.
+    struct Syms(Vec<(u64, u64, String)>);
+    impl SymbolResolver for Syms {
+        fn symbol(&mut self, ins: &iced_x86::Instruction, _: u32, _: Option<u32>, address: u64, _: u32) -> Option<SymbolResult<'_>> {
+            // Only branch targets and RIP-relative operands are addresses.
+            if ins.flow_control() == iced_x86::FlowControl::Next && !ins.is_ip_rel_memory_operand() {
+                return None;
+            }
+            let i = self.0.partition_point(|s| s.0 <= address).checked_sub(1)?;
+            let (a, sz, name) = &self.0[i];
+            (address < a + (*sz).max(1)).then(|| SymbolResult::with_string(address, if address == *a { name.clone() } else { format!("{name}+{:#x}", address - a) }))
+        }
+    }
+    let mut syms: Vec<(u64, u64, String)> = file
+        .symbols()
+        .chain(file.dynamic_symbols())
+        .filter(|s| !s.is_undefined() && s.address() != 0 && s.name().is_ok_and(|n| !n.is_empty()))
+        .map(|s| (s.address(), s.size(), s.name().unwrap_or("").to_string()))
+        .collect();
+    syms.sort_by_key(|s| s.0);
+    let mut fmt = IntelFormatter::with_options(Some(Box::new(Syms(syms))), None);
+    fmt.options_mut().set_first_operand_char_index(8);
+    let mut dec = Decoder::with_ip(64, code, addr, DecoderOptions::NONE);
+    let mut out = vec![];
+    let mut s = String::new();
+    while dec.can_decode() {
+        let ins = dec.decode();
+        s.clear();
+        fmt.format(&ins, &mut s);
+        out.push((ins.ip(), s.clone()));
+    }
+    Ok(out)
+}

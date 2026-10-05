@@ -59,6 +59,12 @@ enum Cmd {
     },
     /// Methods defined in the image.
     Methods { file: PathBuf },
+    /// Disassemble the native code of a code instance (x86-64).
+    Asm {
+        file: PathBuf,
+        /// Code instance offset, or a substring of its specialization (largest match wins).
+        what: String,
+    },
     /// Why a code instance is in the image: its inference chain (needs a provenance sidecar).
     Why {
         file: PathBuf,
@@ -247,14 +253,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let ctx = Ctx { json: cli.json, limit: cli.limit };
     if let Cmd::Diff { a, b } = &cli.cmd {
-        let open = |p: &PathBuf| World::open(p, Options { sysimage: cli.sysimage.clone(), depots: cli.depots.clone(), verbose: cli.verbose });
+        let open = |p: &PathBuf| World::open(&resolve_target(p, &cli.depots)?, Options { sysimage: cli.sysimage.clone(), depots: cli.depots.clone(), verbose: cli.verbose });
         return diff(&ctx, &open(a)?, &open(b)?);
     }
     let file = match &cli.cmd {
         Cmd::Diff { .. } => unreachable!(),
-        Cmd::Summary { file } | Cmd::Heap { file, .. } | Cmd::Compiled { file, .. } | Cmd::Methods { file } | Cmd::Objects { file, .. } | Cmd::Show { file, .. } | Cmd::Why { file, .. }
+        Cmd::Summary { file } | Cmd::Heap { file, .. } | Cmd::Compiled { file, .. } | Cmd::Methods { file } | Cmd::Objects { file, .. } | Cmd::Show { file, .. } | Cmd::Why { file, .. } | Cmd::Asm { file, .. }
         | Cmd::Deps { file } | Cmd::Sources { file, .. } => file.clone(),
     };
+    let file = resolve_target(&file, &cli.depots)?;
     let t0 = Instant::now();
     let w = World::open(&file, Options { sysimage: cli.sysimage.clone(), depots: cli.depots.clone(), verbose: cli.verbose })?;
     if cli.verbose {
@@ -268,6 +275,7 @@ fn main() -> Result<()> {
             ctx.rows("heap", &w, &rows, &[("bytes", "bytes"), ("count", "count"), ("key", "type")], json!({}));
         }
         Cmd::Compiled { by, sort, filter, external, .. } => compiled(&ctx, &w, by, sort, filter, external, cli.provenance.as_deref()),
+        Cmd::Asm { what, .. } => asm(&ctx, &w, &what)?,
         Cmd::Why { what, .. } => why(&ctx, &w, &what, cli.provenance.as_deref())?,
         Cmd::Methods { .. } => {
             let (objs, _) = tables(&w);
@@ -757,6 +765,78 @@ fn why(ctx: &Ctx, w: &World, what: &str, prov: Option<&std::path::Path>) -> Resu
         let arrow = if i == 0 { "  " } else { "  ← called from " };
         let extra = c["native_bytes"].as_u64().map(|n| format!("  [{n} B native, {} B IR]", c["inferred_bytes"])).unwrap_or_default();
         println!("{}{}{}", "  ".repeat(i.min(12)) + arrow, c["specialization"].as_str().unwrap_or(""), extra);
+    }
+    Ok(())
+}
+
+/// Accept a package name in place of a path: the most recently written cache for it in
+/// `$JULIA_DEPOT_PATH` / `~/.julia` (any Julia version).
+fn resolve_target(p: &PathBuf, depots: &[PathBuf]) -> Result<PathBuf> {
+    if p.exists() || p.components().count() > 1 {
+        return Ok(p.clone());
+    }
+    let name = p.to_string_lossy();
+    let mut ds: Vec<PathBuf> = depots.to_vec();
+    if let Ok(dp) = std::env::var("JULIA_DEPOT_PATH") {
+        ds.extend(dp.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        ds.push(std::path::Path::new(&h).join(".julia"));
+    }
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for d in ds {
+        let Ok(vers) = std::fs::read_dir(d.join("compiled")) else { continue };
+        for v in vers.flatten() {
+            let Ok(files) = std::fs::read_dir(v.path().join(&*name)) else { continue };
+            for f in files.flatten() {
+                let fp = f.path();
+                if fp.extension().is_some_and(|e| e == "ji")
+                    && let Ok(t) = f.metadata().and_then(|m| m.modified())
+                    && best.as_ref().is_none_or(|b| t > b.0)
+                {
+                    best = Some((t, fp));
+                }
+            }
+        }
+    }
+    match best {
+        Some((_, f)) => {
+            eprintln!("using {}", f.display());
+            Ok(f)
+        }
+        None => anyhow::bail!("{name}: no such file, and no cache file for a package of that name in the depots"),
+    }
+}
+
+fn pick_ci<'a>(w: &World, rows: &'a [CiRow], what: &str) -> Option<&'a CiRow> {
+    let _ = w;
+    match what.parse::<u32>() {
+        Ok(off) => rows.iter().find(|r| r.obj.off == off),
+        Err(_) => rows
+            .iter()
+            .filter(|r| format!("{}.{}{}", r.module, r.method, r.spec).contains(what))
+            .max_by_key(|r| r.native_bytes + r.wrapper_bytes + r.inferred_bytes),
+    }
+}
+
+fn asm(ctx: &Ctx, w: &World, what: &str) -> Result<()> {
+    let (objs, _) = tables(w);
+    let rows = analysis::code_instances(w, w.target, &objs);
+    let r = pick_ci(w, &rows, what).ok_or_else(|| anyhow::anyhow!("no code instance matches {what:?}"))?;
+    let (Some(addr), Some(buf)) = (r.native_addr, w.target().native_bytes.as_ref()) else {
+        anyhow::bail!("{}.{}{} has no native code in this image", r.module, r.method, r.spec);
+    };
+    let lines = pkgimg_core::native::disassemble(buf, addr, r.native_bytes)?;
+    if ctx.json {
+        let v = json!({"schema": "pkgimg/1", "command": "asm", "specialization": format!("{}.{}{}", r.module, r.method, r.spec),
+            "symbol": r.native_symbol, "bytes": r.native_bytes,
+            "instructions": lines.iter().map(|(a, t)| json!({"address": format!("{a:#x}"), "text": t})).collect::<Vec<_>>()});
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        return Ok(());
+    }
+    println!("; {}.{}{}  ({}, {} bytes)", r.module, r.method, r.spec, r.native_symbol.as_deref().unwrap_or("?"), r.native_bytes);
+    for (a, t) in lines {
+        println!("{a:8x}  {t}");
     }
     Ok(())
 }
