@@ -204,6 +204,8 @@ pub fn show_sig(w: &World, sig: Val) -> String {
 pub struct CiRow {
     #[serde(skip)]
     pub obj: Obj,
+    #[serde(skip)]
+    pub mi: Option<Obj>,
     pub method: String,
     pub module: String,
     pub file: String,
@@ -223,6 +225,12 @@ pub struct CiRow {
     pub infer_self_ms: f32,
     pub infer_total_ms: f32,
     pub rettype: String,
+    /// From the provenance sidecar: MethodInstance whose inference requested this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// From the provenance sidecar: root of that inference (entry point).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 
 pub fn code_instances(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<CiRow> {
@@ -313,7 +321,7 @@ pub fn code_instances(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<CiRow> {
         let ms = |name| w.field_u64(ci, name).map_or(0.0, |x| f16_to_f32(x as u16) * 1000.0);
         let rettype = w.field(ci, "rettype").map(|v| w.show(v, 3)).unwrap_or_default();
         out.push(CiRow {
-            obj: ci, method, module, file, line, spec, owner, status, external_method: ext,
+            obj: ci, mi, parent: None, root: None, method, module, file, line, spec, owner, status, external_method: ext,
             inferred_bytes, inferred, invoke, native_bytes, native_symbol, wrapper_bytes,
             infer_self_ms: ms("time_infer_self"), infer_total_ms: ms("time_infer_total"), rettype,
         });
@@ -432,4 +440,38 @@ pub fn heap_histogram(w: &World, objs: &[ObjEntry], cst: &[ObjEntry], by: Group,
         let count = if e.label == ConstLabel::MemData { 0 } else { 1 };
         (group_key(w, objs, &refs, e, by), e.size as u64, count)
     }))
+}
+
+/// `Module.f(argtypes)` for a MethodInstance.
+pub fn mi_label(w: &World, mi: Obj) -> String {
+    let spec = w.field(mi, "specTypes").map(|s| show_sig(w, s)).unwrap_or_default();
+    match w.field(mi, "def").and_then(|v| v.obj()) {
+        Some(m) if w.kind(m) == Kind::Method => {
+            let r = method_info(w, m);
+            format!("{}.{}{}", r.module, r.name, spec)
+        }
+        Some(m) if w.kind(m) == Kind::Module => format!("<toplevel> {}", w.module_path(m)),
+        _ => w.show(Val::Obj(mi), 4),
+    }
+}
+
+/// Fill `parent`/`root` of code instances from a provenance sidecar.
+pub fn annotate_provenance(w: &World, img: ImgId, cis: &mut [CiRow], p: &crate::provenance::Provenance) {
+    use crate::provenance::PRef;
+    let label = |r: &PRef| -> Option<String> {
+        match r {
+            PRef::None => None,
+            PRef::Obj(off) => {
+                let o = Obj { img, cst: false, off: *off };
+                Some(if w.kind(o) == Kind::MethodInstance { mi_label(w, o) } else { w.show(Val::Obj(o), 4) })
+            }
+            PRef::Text(t) => Some(t.strip_prefix("MethodInstance for ").unwrap_or(t).to_string()),
+        }
+    };
+    for c in cis.iter_mut() {
+        if let Some((par, root)) = p.by_ci.get(&c.obj.off) {
+            c.parent = label(par);
+            c.root = label(root).or_else(|| Some("<self>".into()));
+        }
+    }
 }

@@ -4,6 +4,7 @@ use egui_extras::{Column, TableBuilder};
 use pkgimg_core::analysis::{Group, SectionSel};
 use pkgimg_core::inspect::{self, FieldValue};
 use pkgimg_core::{Obj, Val};
+use std::collections::HashMap;
 use std::sync::mpsc;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -41,6 +42,27 @@ enum State {
     Failed(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CiGroup {
+    None,
+    Method,
+    File,
+    Module,
+    Root,
+    Parent,
+}
+
+fn ci_group_key(c: &pkgimg_core::analysis::CiRow, g: CiGroup) -> String {
+    match g {
+        CiGroup::None => String::new(),
+        CiGroup::Method => format!("{}.{} @ {}:{}", c.module, c.method, c.file.rsplit('/').next().unwrap_or(""), c.line),
+        CiGroup::File => c.file.clone(),
+        CiGroup::Module => c.module.clone(),
+        CiGroup::Root => c.root.clone().unwrap_or_else(|| "<no provenance record>".into()),
+        CiGroup::Parent => c.parent.clone().unwrap_or_else(|| if c.root.is_some() { "<entry point>".into() } else { "<no provenance record>".into() }),
+    }
+}
+
 #[derive(Default)]
 struct Sorted {
     col: usize,
@@ -66,6 +88,9 @@ pub struct App {
     obj_rows: Sorted,
     // code instances
     ci_filter: String,
+    ci_group: CiGroup,
+    ci_group_sel: Option<String>,
+    ci_groups: Sorted,
     ci_sort: Sorted,
     // methods
     m_filter: String,
@@ -96,6 +121,9 @@ impl App {
             obj_exact: None,
             obj_rows: Sorted::default(),
             ci_filter: String::new(),
+            ci_group: CiGroup::None,
+            ci_group_sel: None,
+            ci_groups: Sorted { col: 2, desc: true, ..Default::default() },
             ci_sort: Sorted { col: 0, desc: true, ..Default::default() },
             m_filter: String::new(),
             m_sort: Sorted::default(),
@@ -645,17 +673,50 @@ impl App {
 
     fn compiled(&mut self, ui: &mut Ui, m: &Model) {
         ui.horizontal(|ui| {
+            ui.label("Group by");
+            let has_prov = m.provenance_path.is_some();
+            for (g, name, enabled) in [(CiGroup::None, "none", true), (CiGroup::Method, "method", true), (CiGroup::File, "file", true), (CiGroup::Module, "module", true), (CiGroup::Root, "root", has_prov), (CiGroup::Parent, "parent", has_prov)] {
+                let r = ui.add_enabled(enabled, egui::Button::selectable(self.ci_group == g, name));
+                let r = if enabled { r } else { r.on_disabled_hover_text("needs a provenance sidecar (JULIA_IMAGE_PROVENANCE)") };
+                if r.clicked() {
+                    self.ci_group = g;
+                    self.ci_group_sel = None;
+                    self.ci_groups.key.clear();
+                    self.ci_sort.key.clear();
+                }
+            }
+            if let Some(p) = &m.provenance_path {
+                ui.label(RichText::new("provenance ✔").weak()).on_hover_text(p);
+            }
+        });
+        if self.ci_group != CiGroup::None && self.ci_group_sel.is_none() {
+            self.ci_group_table(ui, m);
+            return;
+        }
+        if let Some(sel) = self.ci_group_sel.clone() {
+            ui.horizontal(|ui| {
+                ui.label(format!("{:?} =", self.ci_group).to_lowercase());
+                ui.strong(&sel);
+                if ui.small_button("✕").clicked() {
+                    self.ci_group_sel = None;
+                    self.ci_sort.key.clear();
+                }
+            });
+        }
+        ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.ci_filter).hint_text("filter (method, module, file, signature)").desired_width(360.0));
             let total: u64 = m.stats.native_bytes;
             ui.label(RichText::new(format!("{} code instances, {} native, {} inferred IR", m.cis.len(), human(total), human(m.stats.inferred_bytes))).weak());
         });
-        let key = format!("{}{}{}", self.ci_filter, self.ci_sort.col, self.ci_sort.desc);
+        let key = format!("{}{}{}{:?}", self.ci_filter, self.ci_sort.col, self.ci_sort.desc, self.ci_group_sel);
         if self.ci_sort.key != key {
             let f = self.ci_filter.to_lowercase();
+            let (g, gsel) = (self.ci_group, self.ci_group_sel.clone());
             let mut order: Vec<usize> = (0..m.cis.len())
                 .filter(|&i| {
                     let c = &m.cis[i];
-                    f.is_empty() || [&c.method, &c.module, &c.file, &c.spec].iter().any(|s| s.to_lowercase().contains(&f))
+                    gsel.as_ref().is_none_or(|s| ci_group_key(c, g) == *s)
+                        && (f.is_empty() || [&c.method, &c.module, &c.file, &c.spec].iter().any(|s| s.to_lowercase().contains(&f)))
                 })
                 .collect();
             let sc = self.ci_sort.col;
@@ -718,6 +779,74 @@ impl App {
         self.ci_sort = sort;
         if let Some(o) = clicked {
             self.select(o);
+        }
+    }
+
+    fn ci_group_table(&mut self, ui: &mut Ui, m: &Model) {
+        let g = self.ci_group;
+        let mut groups: HashMap<String, (u64, u64, u64, f32)> = HashMap::new();
+        for c in &m.cis {
+            let e = groups.entry(ci_group_key(c, g)).or_default();
+            e.0 += 1;
+            e.1 += c.native_bytes + c.wrapper_bytes;
+            e.2 += c.inferred_bytes;
+            e.3 += c.infer_self_ms;
+        }
+        let rows: Vec<(String, (u64, u64, u64, f32))> = {
+            let mut v: Vec<_> = groups.into_iter().collect();
+            let (sc, desc) = (self.ci_groups.col, self.ci_groups.desc);
+            v.sort_by(|a, b| {
+                let o = match sc {
+                    0 => a.0.cmp(&b.0),
+                    1 => a.1.0.cmp(&b.1.0),
+                    2 => a.1.1.cmp(&b.1.1),
+                    3 => a.1.2.cmp(&b.1.2),
+                    _ => a.1.3.total_cmp(&b.1.3),
+                };
+                if desc { o.reverse() } else { o }
+            });
+            v
+        };
+        ui.label(RichText::new(format!("{} groups", rows.len())).weak());
+        let max = rows.iter().map(|r| r.1.1).max().unwrap_or(1).max(1);
+        let color = bar_color(ui);
+        let mut sort = std::mem::take(&mut self.ci_groups);
+        let mut clicked = None;
+        TableBuilder::new(ui)
+            .striped(true)
+            .sense(Sense::click())
+            .column(Column::remainder().at_least(300.0).clip(true))
+            .column(Column::exact(70.0))
+            .column(Column::exact(90.0))
+            .column(Column::exact(90.0))
+            .column(Column::exact(80.0))
+            .column(Column::exact(140.0))
+            .header(20.0, |mut h| {
+                h.col(|ui| sort_header(ui, "group", 0, &mut sort, false));
+                h.col(|ui| sort_header(ui, "CIs", 1, &mut sort, true));
+                h.col(|ui| sort_header(ui, "native", 2, &mut sort, true));
+                h.col(|ui| sort_header(ui, "inferred", 3, &mut sort, true));
+                h.col(|ui| sort_header(ui, "infer ms", 4, &mut sort, true));
+                h.col(|_| {});
+            })
+            .body(|body| {
+                body.rows(18.0, rows.len(), |mut row| {
+                    let (k, (n, nat, inf, ms)) = &rows[row.index()];
+                    row.col(|ui| { ui.label(k); });
+                    row.col(|ui| { ui.label(RichText::new(n.to_string()).monospace()); });
+                    row.col(|ui| { ui.label(RichText::new(human(*nat)).monospace()); });
+                    row.col(|ui| { ui.label(RichText::new(human(*inf)).monospace()); });
+                    row.col(|ui| { ui.label(RichText::new(format!("{ms:.1}")).monospace()); });
+                    row.col(|ui| data_bar(ui, *nat as f32 / max as f32, color));
+                    if row.response().clicked() {
+                        clicked = Some(k.clone());
+                    }
+                });
+            });
+        self.ci_groups = sort;
+        if let Some(k) = clicked {
+            self.ci_group_sel = Some(k);
+            self.ci_sort.key.clear();
         }
     }
 
@@ -935,6 +1064,28 @@ impl App {
                 ui.add_space(4.0);
                 let shown: String = s.chars().take(2000).collect();
                 ui.label(RichText::new(format!("{shown:?}")).monospace());
+            }
+            if let Some(c) = m.cis.iter().find(|c| c.obj == o)
+                && (c.root.is_some() || c.native_symbol.is_some())
+            {
+                ui.add_space(4.0);
+                egui::Grid::new("ciextra").num_columns(2).show(ui, |ui| {
+                    if let Some(s) = &c.native_symbol {
+                        ui.label(RichText::new("native").weak());
+                        ui.label(RichText::new(format!("{s}  ({} B + {} B wrapper)", c.native_bytes, c.wrapper_bytes)).monospace());
+                        ui.end_row();
+                    }
+                    if let Some(p) = &c.parent {
+                        ui.label(RichText::new("requested by").weak());
+                        ui.add(egui::Label::new(p).truncate());
+                        ui.end_row();
+                    }
+                    if let Some(r) = &c.root {
+                        ui.label(RichText::new("inference root").weak());
+                        ui.add(egui::Label::new(r).truncate());
+                        ui.end_row();
+                    }
+                });
             }
             let fields = inspect::fields(w, o);
             if !fields.is_empty() {

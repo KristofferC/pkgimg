@@ -19,6 +19,7 @@ pub struct Model {
     pub hist_cache: HashMap<(Group, SectionSel), Vec<HistRow>>,
     pub load_time: Duration,
     pub stats: Stats,
+    pub provenance_path: Option<String>,
 }
 
 #[derive(Default)]
@@ -50,7 +51,15 @@ impl Model {
                 })
             })
             .collect();
-        let cis = analysis::code_instances(&w, w.target, &objs);
+        let mut cis = analysis::code_instances(&w, w.target, &objs);
+        #[cfg(not(target_arch = "wasm32"))]
+        let provenance = pkgimg_core::provenance::Provenance::locate(&w, None);
+        #[cfg(target_arch = "wasm32")]
+        let provenance: Option<pkgimg_core::provenance::Provenance> = None;
+        if let Some(p) = &provenance {
+            analysis::annotate_provenance(&w, w.target, &mut cis, p);
+        }
+        let provenance_path = provenance.map(|p| p.path.display().to_string());
         let methods = analysis::methods(&w, w.target, &objs);
         let srctext = w.target().srctext();
         let stats = Stats {
@@ -65,7 +74,7 @@ impl Model {
         };
         let mut m = Model {
             w, objs, cst, obj_key, keys, cis, methods, srctext,
-            hist_cache: HashMap::new(), load_time, stats,
+            hist_cache: HashMap::new(), load_time, stats, provenance_path,
         };
         m.hist(Group::Type, SectionSel::All);
         m

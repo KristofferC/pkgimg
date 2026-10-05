@@ -7,6 +7,7 @@ pub mod heap;
 pub mod image;
 pub mod inspect;
 pub mod native;
+pub mod provenance;
 pub mod world;
 
 pub use image::Image;

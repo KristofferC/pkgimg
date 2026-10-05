@@ -24,6 +24,9 @@ struct Cli {
     limit: usize,
     #[arg(long, short, global = true)]
     verbose: bool,
+    /// Provenance sidecar (file, or directory as given to JULIA_IMAGE_PROVENANCE).
+    #[arg(long, global = true)]
+    provenance: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -56,6 +59,12 @@ enum Cmd {
     },
     /// Methods defined in the image.
     Methods { file: PathBuf },
+    /// Why a code instance is in the image: its inference chain (needs a provenance sidecar).
+    Why {
+        file: PathBuf,
+        /// Code instance offset, or a substring of its specialization (largest match wins).
+        what: String,
+    },
     /// List individual objects.
     Objects {
         file: PathBuf,
@@ -109,6 +118,10 @@ enum CiBy {
     Method,
     File,
     Module,
+    /// Entry point of the inference that produced each code instance (needs provenance).
+    Root,
+    /// Caller whose inference requested each code instance (needs provenance).
+    Parent,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
@@ -239,7 +252,7 @@ fn main() -> Result<()> {
     }
     let file = match &cli.cmd {
         Cmd::Diff { .. } => unreachable!(),
-        Cmd::Summary { file } | Cmd::Heap { file, .. } | Cmd::Compiled { file, .. } | Cmd::Methods { file } | Cmd::Objects { file, .. } | Cmd::Show { file, .. }
+        Cmd::Summary { file } | Cmd::Heap { file, .. } | Cmd::Compiled { file, .. } | Cmd::Methods { file } | Cmd::Objects { file, .. } | Cmd::Show { file, .. } | Cmd::Why { file, .. }
         | Cmd::Deps { file } | Cmd::Sources { file, .. } => file.clone(),
     };
     let t0 = Instant::now();
@@ -254,7 +267,8 @@ fn main() -> Result<()> {
             let rows = heap_hist(&w, &objs, &cst, by, section);
             ctx.rows("heap", &w, &rows, &[("bytes", "bytes"), ("count", "count"), ("key", "type")], json!({}));
         }
-        Cmd::Compiled { by, sort, filter, external, .. } => compiled(&ctx, &w, by, sort, filter, external),
+        Cmd::Compiled { by, sort, filter, external, .. } => compiled(&ctx, &w, by, sort, filter, external, cli.provenance.as_deref()),
+        Cmd::Why { what, .. } => why(&ctx, &w, &what, cli.provenance.as_deref())?,
         Cmd::Methods { .. } => {
             let (objs, _) = tables(&w);
             let mut rows = analysis::methods(&w, w.target, &objs);
@@ -395,9 +409,22 @@ struct CiGroup {
     infer_self_ms: f32,
 }
 
-fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>, external: bool) {
+fn load_cis(w: &World, objs: &[ObjEntry], prov: Option<&std::path::Path>, need: bool) -> Vec<CiRow> {
+    let mut rows = analysis::code_instances(w, w.target, objs);
+    match pkgimg_core::provenance::Provenance::locate(w, prov) {
+        Some(p) => {
+            eprintln!("provenance: {} ({} records)", p.path.display(), p.by_ci.len());
+            analysis::annotate_provenance(w, w.target, &mut rows, &p);
+        }
+        None if need => eprintln!("warning: no provenance sidecar found; precompile with JULIA_IMAGE_PROVENANCE=<dir> (instrumented Julia) and pass --provenance <dir>"),
+        None => {}
+    }
+    rows
+}
+
+fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>, external: bool, prov: Option<&std::path::Path>) {
     let (objs, _) = tables(w);
-    let mut rows: Vec<CiRow> = analysis::code_instances(w, w.target, &objs);
+    let mut rows: Vec<CiRow> = load_cis(w, &objs, prov, matches!(by, CiBy::Root | CiBy::Parent));
     if let Some(f) = &filter {
         rows.retain(|r| r.method.contains(f.as_str()) || r.module.contains(f.as_str()));
     }
@@ -414,6 +441,8 @@ fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>
                 CiBy::Method => format!("{}.{} @ {}:{}", r.module, r.method, r.file, r.line),
                 CiBy::File => r.file.clone(),
                 CiBy::Module => r.module.clone(),
+                CiBy::Root => r.root.clone().unwrap_or_else(|| "<no provenance record>".into()),
+                CiBy::Parent => r.parent.clone().unwrap_or_else(|| if r.root.is_some() { "<entry point>".into() } else { "<no provenance record>".into() }),
                 CiBy::None => unreachable!(),
             };
             let g = m.entry(key.clone()).or_insert_with(|| CiGroup { key, ..Default::default() });
@@ -683,4 +712,51 @@ fn show(ctx: &Ctx, w: &World, o: pkgimg_core::Obj) {
             println!("  @{:<10} {:<32} {}", r["offset"], r["slot"].as_str().unwrap_or(""), r["value"].as_str().unwrap_or(""));
         }
     }
+}
+
+fn why(ctx: &Ctx, w: &World, what: &str, prov: Option<&std::path::Path>) -> Result<()> {
+    let (objs, _) = tables(w);
+    let rows = load_cis(w, &objs, prov, true);
+    let pick = match what.parse::<u32>() {
+        Ok(off) => rows.iter().find(|r| r.obj.off == off),
+        Err(_) => rows
+            .iter()
+            .filter(|r| format!("{}.{}{}", r.module, r.method, r.spec).contains(what))
+            .max_by_key(|r| r.native_bytes + r.wrapper_bytes + r.inferred_bytes),
+    };
+    let Some(start) = pick else { anyhow::bail!("no code instance matches {what:?}") };
+    // Follow parents: parent label -> code instance with that MethodInstance label.
+    let by_label: std::collections::HashMap<String, &CiRow> =
+        rows.iter().filter_map(|r| r.mi.map(|mi| (analysis::mi_label(w, mi), r))).collect();
+    let mut chain = vec![];
+    let mut cur = Some(start);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(r) = cur {
+        if !seen.insert(r.obj.off) {
+            break;
+        }
+        chain.push(json!({
+            "specialization": format!("{}.{}{}", r.module, r.method, r.spec),
+            "offset": r.obj.off, "native_bytes": r.native_bytes + r.wrapper_bytes,
+            "inferred_bytes": r.inferred_bytes, "file": r.file, "line": r.line,
+        }));
+        cur = r.parent.as_ref().and_then(|p| by_label.get(p).copied());
+        if cur.is_none()
+            && let Some(p) = &r.parent
+        {
+            chain.push(json!({"specialization": p, "note": "caller not compiled into this image"}));
+        }
+    }
+    let v = json!({"schema": "pkgimg/1", "command": "why", "image": image_id(w), "root": start.root, "chain": chain});
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        return Ok(());
+    }
+    println!("root (inference entry point): {}", start.root.as_deref().unwrap_or("<unknown>"));
+    for (i, c) in chain.iter().enumerate() {
+        let arrow = if i == 0 { "  " } else { "  ← called from " };
+        let extra = c["native_bytes"].as_u64().map(|n| format!("  [{n} B native, {} B IR]", c["inferred_bytes"])).unwrap_or_default();
+        println!("{}{}{}", "  ".repeat(i.min(12)) + arrow, c["specialization"].as_str().unwrap_or(""), extra);
+    }
+    Ok(())
 }
