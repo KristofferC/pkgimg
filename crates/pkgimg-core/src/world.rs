@@ -1015,9 +1015,6 @@ fn find_cache_file(
 fn sysimage_candidates(img: &Image) -> Vec<PathBuf> {
     let so = format!("sys.{}", crate::image::DLEXT);
     let mut prefixes: Vec<PathBuf> = vec![];
-    if let Ok(p) = std::env::var("JULIA_SYSIMAGE") {
-        return vec![PathBuf::from(p)];
-    }
     // stdlib caches: <prefix>/share/julia/compiled/vX.Y/<Name>/<file>.ji
     if let Some(prefix) = img.path.ancestors().nth(6) {
         prefixes.push(prefix.to_path_buf());
@@ -1042,6 +1039,12 @@ fn sysimage_candidates(img: &Image) -> Vec<PathBuf> {
     }
     let want = &img.header.base.julia_version;
     let mut out = vec![];
+    // An explicit hint is tried first but still has to match the Core build id.
+    if let Ok(p) = std::env::var("JULIA_SYSIMAGE")
+        && !p.is_empty()
+    {
+        out.push(PathBuf::from(p));
+    }
     for prefix in prefixes {
         let c = prefix.join("lib").join("julia").join(&so);
         if out.contains(&c) || !c.exists() {
