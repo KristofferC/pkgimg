@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-memmap2 = "0.9.11"
 object = { version = "0.40.0", default-features = false, features = ["read_core", "elf", "macho", "coff", "pe", "std"] }
 ruzstd = "0.9.0"
 serde = { version = "1.0.229", features = ["derive"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9.11"

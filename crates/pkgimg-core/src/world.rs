@@ -5,11 +5,10 @@ use crate::bytes::{rd_u16, rd_u32, rd_u64};
 use crate::header::ModuleId;
 use crate::heap::{RefTag, split_reloc, DEPS_IDX_OFFSET};
 use crate::image::Image;
-use anyhow::{Context, Result};
-use std::cell::RefCell;
+use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 pub type ImgId = u16;
 
@@ -103,6 +102,7 @@ pub struct TypeInfo {
     pub smalltag: u8,
     pub layout: Option<Layout>,
     pub field_names: Vec<String>,
+    pub field_types: Vec<Val>,
     pub params: Vec<Val>,
 }
 
@@ -123,6 +123,7 @@ impl TypeInfo {
 // C struct offsets needed to bootstrap generic decoding (julia.h, master / 1.13).
 const DT_NAME: u32 = 0;
 const DT_PARAMETERS: u32 = 16;
+const DT_TYPES: u32 = 24;
 const DT_LAYOUT: u32 = 40;
 const DT_FLAGS: u32 = 52;
 const TN_NAME: u32 = 0;
@@ -148,8 +149,8 @@ pub struct World {
     pub sysimg: Option<ImgId>,
     pub target: ImgId,
     pub missing: Vec<ModuleId>,
-    types: RefCell<HashMap<Obj, Rc<TypeInfo>>>,
-    modpaths: RefCell<HashMap<Obj, Rc<str>>>,
+    types: Mutex<HashMap<Obj, Arc<TypeInfo>>>,
+    modpaths: Mutex<HashMap<Obj, Arc<str>>>,
     smalltags: Vec<Option<Obj>>,
     datatype_type: Option<Obj>,
     /// DataTypes defined in Core, by name (from the system image).
@@ -185,19 +186,8 @@ impl World {
         if opts.depots.is_empty() {
             opts.depots = default_depots();
         }
-        let is_sys = target_img.header.pkg.is_none();
-        let mut w = World {
-            images: vec![target_img],
-            deps: vec![],
-            sysimg: is_sys.then_some(0),
-            target: 0,
-            missing: vec![],
-            types: RefCell::default(),
-            modpaths: RefCell::default(),
-            smalltags: vec![None; 64],
-            datatype_type: None,
-            core_types: HashMap::new(),
-        };
+        let mut w = World::new(target_img);
+        let is_sys = w.sysimg.is_some();
         if !is_sys {
             let cands = match &opts.sysimage {
                 Some(p) => vec![p.clone()],
@@ -222,8 +212,6 @@ impl World {
             if w.sysimg.is_none() {
                 eprintln!("warning: no matching system image found (use --sysimage); external references stay unresolved");
             }
-        } else {
-            w.index_sysimage();
         }
         // stdlib caches live next to the system image: <prefix>/share/julia/compiled
         if let Some(s) = w.sysimg {
@@ -233,8 +221,45 @@ impl World {
             }
         }
         w.deps = vec![vec![]; w.images.len()];
-        w.resolve_deps(&opts)?;
+        w.resolve_deps(&opts.depots, &mut vec![], opts.verbose);
         Ok(w)
+    }
+
+    fn new(target: Image) -> World {
+        let is_sys = target.header.pkg.is_none();
+        let mut w = World {
+            images: vec![target],
+            deps: vec![],
+            sysimg: is_sys.then_some(0),
+            target: 0,
+            missing: vec![],
+            types: Mutex::default(),
+            modpaths: Mutex::default(),
+            smalltags: vec![None; 64],
+            datatype_type: None,
+            core_types: HashMap::new(),
+        };
+        if is_sys {
+            w.index_sysimage();
+        }
+        w
+    }
+
+    /// Build a world from already-loaded images (no filesystem access): `others` may hold
+    /// the system image and any dependency images; unmatched ones are ignored.
+    pub fn from_images(target: Image, others: Vec<Image>) -> World {
+        let mut w = World::new(target);
+        let (sys, mut pool): (Vec<Image>, Vec<Image>) = others.into_iter().partition(|i| i.header.pkg.is_none());
+        if w.sysimg.is_none() {
+            for im in sys {
+                if w.try_sysimage_image(im, false) {
+                    break;
+                }
+            }
+        }
+        w.deps = vec![vec![]; w.images.len()];
+        w.resolve_deps(&[], &mut pool, false);
+        w
     }
 
     /// Load `p` as the system image if its `Core` matches the target's (or `force`).
@@ -243,6 +268,13 @@ impl World {
         if im.header.pkg.is_some() {
             anyhow::bail!("not a system image");
         }
+        Ok(self.try_sysimage_image(im, force))
+    }
+
+    fn try_sysimage_image(&mut self, im: Image, force: bool) -> bool {
+        if im.header.pkg.is_some() {
+            return false;
+        }
         self.images.push(im);
         let id = (self.images.len() - 1) as ImgId;
         self.sysimg = Some(id);
@@ -250,13 +282,13 @@ impl World {
         let want = self.images[0].header.pkg.as_ref().and_then(|p| p.required_modules.iter().find(|m| m.name == "Core")).map(|m| m.build_id_lo);
         let have = self.toplevel_modules(id).into_iter().find(|m| m.0 == "Core").map(|m| m.3);
         if force || want.is_none() || want == have {
-            return Ok(true);
+            return true;
         }
         self.images.pop();
         self.sysimg = None;
-        self.types.borrow_mut().clear();
-        self.modpaths.borrow_mut().clear();
-        Ok(false)
+        self.types.lock().unwrap().clear();
+        self.modpaths.lock().unwrap().clear();
+        false
     }
 
     pub fn img(&self, id: ImgId) -> &Image {
@@ -341,7 +373,9 @@ impl World {
         out
     }
 
-    fn resolve_deps(&mut self, opts: &Options) -> Result<()> {
+    /// Map every package image's depsidx to an image, taking images from `pool` first and
+    /// then searching `depots`.
+    fn resolve_deps(&mut self, depots: &[PathBuf], pool: &mut Vec<Image>, verbose: bool) {
         let mut by_id: HashMap<(String, u64), ImgId> = HashMap::new();
         if let Some(si) = self.sysimg {
             for (name, uuid, _hi, lo) in self.toplevel_modules(si) {
@@ -362,34 +396,47 @@ impl World {
             let mut map = vec![self.sysimg];
             for m in &pkg.required_modules {
                 let key = (format!("{}/{}", m.name, m.uuid), m.build_id_lo);
-                let id = match by_id.get(&key) {
-                    Some(&id) => Some(id),
-                    None => {
-                        let found = find_cache_file(m, ver, &opts.depots, &mut cands);
-                        match found {
-                            Some(p) => match Image::open(&p) {
-                                Ok(im) => {
-                                    if opts.verbose {
-                                        eprintln!("loaded dependency {} from {}", m.name, p.display());
-                                    }
-                                    self.images.push(im);
-                                    self.deps.push(vec![]);
-                                    let id = (self.images.len() - 1) as ImgId;
-                                    by_id.insert(key, id);
-                                    Some(id)
+                if let Some(&id) = by_id.get(&key) {
+                    map.push(Some(id));
+                    continue;
+                }
+                let defines = |im: &Image| {
+                    im.header.pkg.as_ref().is_some_and(|p| {
+                        p.worklist.iter().any(|w| w.name == m.name && w.uuid == m.uuid && w.build_id_lo == m.build_id_lo)
+                    })
+                };
+                let loaded = if let Some(k) = pool.iter().position(defines) {
+                    Some(pool.swap_remove(k))
+                } else {
+                    match find_cache_file(m, ver, depots, &mut cands) {
+                        Some(p) => match Image::open(&p) {
+                            Ok(im) => {
+                                if verbose {
+                                    eprintln!("loaded dependency {} from {}", m.name, p.display());
                                 }
-                                Err(e) => {
-                                    eprintln!("warning: {}: {e:#}", p.display());
-                                    None
-                                }
-                            },
-                            None => {
-                                if !self.missing.iter().any(|x| x.name == m.name && x.uuid == m.uuid) {
-                                    self.missing.push(m.clone());
-                                }
+                                Some(im)
+                            }
+                            Err(e) => {
+                                eprintln!("warning: {}: {e:#}", p.display());
                                 None
                             }
+                        },
+                        None => None,
+                    }
+                };
+                let id = match loaded {
+                    Some(im) => {
+                        self.images.push(im);
+                        self.deps.push(vec![]);
+                        let id = (self.images.len() - 1) as ImgId;
+                        by_id.insert(key, id);
+                        Some(id)
+                    }
+                    None => {
+                        if !self.missing.iter().any(|x| x.name == m.name && x.uuid == m.uuid) {
+                            self.missing.push(m.clone());
                         }
+                        None
                     }
                 };
                 map.push(id);
@@ -397,7 +444,6 @@ impl World {
             self.deps[i] = map;
             i += 1;
         }
-        Ok(())
     }
 
     // ---------------------------------------------------------------- decoding
@@ -505,18 +551,18 @@ impl World {
         self.decode_at(o.img, o.off.checked_sub(8)? as usize).obj()
     }
 
-    pub fn type_info(&self, o: Obj) -> Option<Rc<TypeInfo>> {
+    pub fn type_info(&self, o: Obj) -> Option<Arc<TypeInfo>> {
         let t = self.type_of(o)?;
         self.datatype(t)
     }
 
     /// Information about a DataType object.
-    pub fn datatype(&self, t: Obj) -> Option<Rc<TypeInfo>> {
-        if let Some(ti) = self.types.borrow().get(&t) {
-            return Some(ti.clone());
+    pub fn datatype(&self, t: Obj) -> Option<Arc<TypeInfo>> {
+        if let Some(ti) = self.types.lock().unwrap().get(&t).cloned() {
+            return Some(ti);
         }
-        let ti = Rc::new(self.build_typeinfo(t)?);
-        self.types.borrow_mut().insert(t, ti.clone());
+        let ti = Arc::new(self.build_typeinfo(t)?);
+        self.types.lock().unwrap().insert(t, ti.clone());
         Some(ti)
     }
 
@@ -537,6 +583,7 @@ impl World {
         }
         let flags = rd_u16(self.bytes(t, DT_FLAGS, 2), 0);
         let params = self.ptr(t, DT_PARAMETERS).obj().map(|p| self.svec(p)).unwrap_or_default();
+        let field_types = self.ptr(t, DT_TYPES).obj().map(|p| self.svec(p)).unwrap_or_default();
         let kind = if module == "Core" {
             match name.as_str() {
                 "DataType" => Kind::DataType,
@@ -563,7 +610,7 @@ impl World {
         Some(TypeInfo {
             obj: t, name, module, kind, mutable,
             smalltag: ((flags >> 10) & 63) as u8,
-            layout, field_names, params,
+            layout, field_names, field_types, params,
         })
     }
 
@@ -673,9 +720,9 @@ impl World {
     }
 
     /// `Parent.Child` path of a module object.
-    pub fn module_path(&self, m: Obj) -> Rc<str> {
-        if let Some(p) = self.modpaths.borrow().get(&m) {
-            return p.clone();
+    pub fn module_path(&self, m: Obj) -> Arc<str> {
+        if let Some(p) = self.modpaths.lock().unwrap().get(&m).cloned() {
+            return p;
         }
         let mut parts = vec![];
         let mut cur = m;
@@ -690,8 +737,8 @@ impl World {
             }
         }
         parts.reverse();
-        let s: Rc<str> = parts.join(".").into();
-        self.modpaths.borrow_mut().insert(m, s.clone());
+        let s: Arc<str> = parts.join(".").into();
+        self.modpaths.lock().unwrap().insert(m, s.clone());
         s
     }
 
@@ -763,6 +810,9 @@ impl World {
                         let Some(dt) = self.datatype(o) else { return s.push('?') };
                         if dt.name == "Tuple" && dt.module == "Core" {
                             s.push_str("Tuple");
+                        } else if let Some(f) = dt.name.strip_prefix('#').filter(|f| !f.contains('#') && !f.is_empty() && dt.params.is_empty()) {
+                            // singleton function type
+                            write!(s, "typeof({f})").unwrap();
                         } else {
                             s.push_str(&dt.name);
                         }
@@ -828,8 +878,56 @@ impl World {
                         s.push_str(&self.field(o, "name").and_then(|n| self.sym_name(n)).unwrap_or_default());
                     }
                     Kind::String => {
-                        let st = self.string(o);
-                        write!(s, "{:?}", st.chars().take(40).collect::<String>()).unwrap();
+                        let n = self.string_len(o);
+                        let raw = self.bytes(o, 8, n.min(64) as u32);
+                        let binary = raw.iter().filter(|&&c| c < 0x20 && c != b'\n' && c != b'\t').count() > 2;
+                        if binary {
+                            write!(s, "<{n}-byte binary String>").unwrap();
+                        } else {
+                            let st = self.string(o);
+                            write!(s, "{:?}", st.chars().take(60).collect::<String>()).unwrap();
+                            if st.chars().count() > 60 {
+                                s.push('…');
+                            }
+                        }
+                    }
+                    Kind::SimpleVector => {
+                        let n = self.word(o, 0);
+                        if n <= 4 {
+                            s.push_str("svec(");
+                            for (i, e) in self.svec(o).into_iter().enumerate() {
+                                if i > 0 {
+                                    s.push_str(", ");
+                                }
+                                self.show_into(s, e, depth - 1);
+                            }
+                            s.push(')');
+                        } else {
+                            write!(s, "svec(<{n} elements>)").unwrap();
+                        }
+                    }
+                    Kind::Method => {
+                        let name = self.field(o, "name").and_then(|v| self.sym_name(v)).unwrap_or_default();
+                        let module = self.field(o, "module").and_then(|v| v.obj()).map(|m| self.module_path(m).to_string()).unwrap_or_default();
+                        let file = self.field(o, "file").and_then(|v| self.sym_name(v)).unwrap_or_default();
+                        let line = self.field_u64(o, "line").map_or(0, |l| l as i32);
+                        let file = file.rsplit('/').next().unwrap_or("");
+                        write!(s, "{module}.{name} @ {file}:{line}").unwrap();
+                    }
+                    Kind::MethodInstance => {
+                        s.push_str("MethodInstance for ");
+                        self.show_into(s, self.field(o, "specTypes").unwrap_or(Val::Null), depth.min(4));
+                    }
+                    Kind::CodeInstance => {
+                        s.push_str("CodeInstance for ");
+                        let mut mi = self.field(o, "def").unwrap_or(Val::Null);
+                        if let Some(d) = mi.obj().filter(|d| self.kind(*d) != Kind::MethodInstance) {
+                            mi = self.field(d, "def").unwrap_or(Val::Null);
+                        }
+                        match mi.obj() {
+                            Some(m) => self.show_into(s, self.field(m, "specTypes").unwrap_or(Val::Null), depth.min(4)),
+                            None => s.push('?'),
+                        }
                     }
                     Kind::Module => s.push_str(&self.module_path(o)),
                     _ if ti.module == "Core" && (ti.name == "TypeEq" || ti.name == "TypeEgal") => {
@@ -867,6 +965,12 @@ impl World {
 }
 
 /// Locate a dependency's cache file in the depots by uuid and build id.
+#[cfg(target_arch = "wasm32")]
+fn find_cache_file(_: &ModuleId, _: Option<(u32, u32)>, _: &[PathBuf], _: &mut HashMap<String, Vec<PathBuf>>) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn find_cache_file(
     m: &ModuleId,
     ver: Option<(u32, u32)>,
@@ -918,6 +1022,7 @@ fn find_cache_file(
 }
 
 /// Candidate system images for a package image, most likely first.
+#[cfg(not(target_arch = "wasm32"))]
 fn sysimage_candidates(img: &Image) -> Vec<PathBuf> {
     let so = format!("sys.{}", crate::image::DLEXT);
     let mut prefixes: Vec<PathBuf> = vec![];
@@ -964,4 +1069,9 @@ fn sysimage_candidates(img: &Image) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[cfg(target_arch = "wasm32")]
+fn sysimage_candidates(_: &Image) -> Vec<PathBuf> {
+    vec![]
 }

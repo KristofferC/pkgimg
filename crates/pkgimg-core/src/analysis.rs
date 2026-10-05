@@ -388,3 +388,48 @@ pub fn first_referrers(w: &World, img: ImgId, objs: &[ObjEntry]) -> HashMap<Obj,
     }
     out
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    Type,
+    FullType,
+    Referrer,
+    Section,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionSel {
+    All,
+    Objects,
+    Const,
+}
+
+/// Grouping key of one entry; `refs` is needed for `Group::Referrer`.
+pub fn group_key(w: &World, objs: &[ObjEntry], refs: &HashMap<Obj, (usize, u32)>, e: &ObjEntry, by: Group) -> String {
+    match by {
+        Group::Type => type_key(w, e, false),
+        Group::FullType => type_key(w, e, true),
+        Group::Section => if e.obj.cst { "const_data".into() } else { "objects".into() },
+        Group::Referrer => {
+            let t = type_key(w, e, false);
+            match refs.get(&e.obj) {
+                _ if e.label == ConstLabel::MemData => format!("{t} (element data)"),
+                Some(&(oi, pos)) => format!("{t} <- {}", slot_label(w, &objs[oi], pos)),
+                None => format!("{t} <- (root)"),
+            }
+        }
+    }
+}
+
+pub fn heap_histogram(w: &World, objs: &[ObjEntry], cst: &[ObjEntry], by: Group, sel: SectionSel) -> Vec<HistRow> {
+    let refs = if by == Group::Referrer { first_referrers(w, objs.first().map_or(w.target, |e| e.obj.img), objs) } else { HashMap::new() };
+    let it: Box<dyn Iterator<Item = &ObjEntry>> = match sel {
+        SectionSel::All => Box::new(objs.iter().chain(cst)),
+        SectionSel::Objects => Box::new(objs.iter()),
+        SectionSel::Const => Box::new(cst.iter()),
+    };
+    histogram(it.map(|e| {
+        let count = if e.label == ConstLabel::MemData { 0 } else { 1 };
+        (group_key(w, objs, &refs, e, by), e.size as u64, count)
+    }))
+}

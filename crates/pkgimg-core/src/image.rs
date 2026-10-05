@@ -22,11 +22,17 @@ pub struct Image {
 
 pub const DLEXT: &str = if cfg!(target_os = "macos") { "dylib" } else if cfg!(windows) { "dll" } else { "so" };
 
+#[cfg(not(target_arch = "wasm32"))]
 fn map_file(p: &Path) -> Result<Blob> {
     let f = std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
     // SAFETY: cache files are not expected to be modified while we read them.
     let m = unsafe { memmap2::Mmap::map(&f) }.with_context(|| format!("mapping {}", p.display()))?;
     Ok(Blob::new(Arc::new(m)))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn map_file(p: &Path) -> Result<Blob> {
+    Ok(Blob::from_vec(std::fs::read(p).with_context(|| format!("reading {}", p.display()))?))
 }
 
 fn is_native(p: &Path) -> bool {

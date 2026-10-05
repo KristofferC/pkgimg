@@ -68,6 +68,14 @@ enum Cmd {
         a: PathBuf,
         b: PathBuf,
     },
+    /// Decode one object: fields, elements and referrers (offset from `objects`).
+    Show {
+        file: PathBuf,
+        offset: u32,
+        /// The offset is in the const-data section.
+        #[arg(long = "const")]
+        cst: bool,
+    },
     /// Required modules and where they were resolved.
     Deps { file: PathBuf },
     /// Source files embedded in the cache file.
@@ -207,29 +215,19 @@ fn tables(w: &World) -> (Vec<ObjEntry>, Vec<ObjEntry>) {
 }
 
 fn heap_hist(w: &World, objs: &[ObjEntry], cst: &[ObjEntry], by: HeapBy, section: Section) -> Vec<HistRow> {
-    let sel: Vec<&ObjEntry> = match section {
-        Section::All => objs.iter().chain(cst).collect(),
-        Section::Objects => objs.iter().collect(),
-        Section::Const => cst.iter().collect(),
+    use analysis::{Group, SectionSel};
+    let by = match by {
+        HeapBy::Type => Group::Type,
+        HeapBy::FullType => Group::FullType,
+        HeapBy::Referrer => Group::Referrer,
+        HeapBy::Section => Group::Section,
     };
-    let refs = if by == HeapBy::Referrer { analysis::first_referrers(w, w.target, objs) } else { Default::default() };
-    analysis::histogram(sel.into_iter().map(|e| {
-        let key = match by {
-            HeapBy::Referrer => {
-                let t = analysis::type_key(w, e, false);
-                match refs.get(&e.obj) {
-                    _ if e.label == ConstLabel::MemData => format!("{t} (element data)"),
-                    Some(&(oi, pos)) => format!("{t} <- {}", analysis::slot_label(w, &objs[oi], pos)),
-                    None => format!("{t} <- (root)"),
-                }
-            }
-            HeapBy::Type => analysis::type_key(w, e, false),
-            HeapBy::FullType => analysis::type_key(w, e, true),
-            HeapBy::Section => if e.obj.cst { "const_data".into() } else { "objects".into() },
-        };
-        let count = if e.label == ConstLabel::MemData { 0 } else { 1 };
-        (key, e.size as u64, count)
-    }))
+    let sel = match section {
+        Section::All => SectionSel::All,
+        Section::Objects => SectionSel::Objects,
+        Section::Const => SectionSel::Const,
+    };
+    analysis::heap_histogram(w, objs, cst, by, sel)
 }
 
 fn main() -> Result<()> {
@@ -241,7 +239,7 @@ fn main() -> Result<()> {
     }
     let file = match &cli.cmd {
         Cmd::Diff { .. } => unreachable!(),
-        Cmd::Summary { file } | Cmd::Heap { file, .. } | Cmd::Compiled { file, .. } | Cmd::Methods { file } | Cmd::Objects { file, .. }
+        Cmd::Summary { file } | Cmd::Heap { file, .. } | Cmd::Compiled { file, .. } | Cmd::Methods { file } | Cmd::Objects { file, .. } | Cmd::Show { file, .. }
         | Cmd::Deps { file } | Cmd::Sources { file, .. } => file.clone(),
     };
     let t0 = Instant::now();
@@ -265,6 +263,7 @@ fn main() -> Result<()> {
         }
         Cmd::Deps { .. } => deps(&ctx, &w),
         Cmd::Diff { .. } => unreachable!(),
+        Cmd::Show { offset, cst, .. } => show(&ctx, &w, pkgimg_core::Obj { img: w.target, cst, off: offset }),
         Cmd::Objects { ty, .. } => {
             let (objs, cst) = tables(&w);
             let mut rows = vec![];
@@ -612,4 +611,76 @@ fn diff(ctx: &Ctx, a: &World, b: &World) -> Result<()> {
     let rows: Vec<Value> = types[..lim(types.len())].iter().map(|c| serde_json::to_value(c).unwrap()).collect();
     print_table(&rows, &[("delta_bytes", "delta"), ("a_bytes", "a"), ("b_bytes", "b"), ("key", "type")]);
     Ok(())
+}
+
+fn val_json(w: &World, v: pkgimg_core::Val) -> Value {
+    match v {
+        pkgimg_core::Val::Obj(o) => json!({
+            "value": w.show(v, 3),
+            "type": w.type_info(o).map(|t| t.qualified()),
+            "image": if o.img == w.target { None } else { Some(w.img(o.img).display_name()) },
+            "offset": o.off, "const": o.cst,
+        }),
+        v => json!({"value": w.show(v, 3)}),
+    }
+}
+
+fn show(ctx: &Ctx, w: &World, o: pkgimg_core::Obj) {
+    use pkgimg_core::inspect::{self, FieldValue};
+    let (objs, _) = tables(w);
+    let ty = w.type_info(o).map(|t| w.show(pkgimg_core::Val::Obj(t.obj), 4));
+    let fields: Vec<Value> = inspect::fields(w, o)
+        .into_iter()
+        .map(|f| {
+            let mut v = match f.value {
+                FieldValue::Ptr(p) => val_json(w, p),
+                FieldValue::Bits(b) => json!({"value": b}),
+            };
+            v["name"] = json!(f.name);
+            v["field_type"] = json!(f.ty);
+            v
+        })
+        .collect();
+    let elems = inspect::elements(w, o, 50).map(|(n, es)| json!({"length": n, "first": es.into_iter().map(|e| val_json(w, e)).collect::<Vec<_>>()}));
+    let refs: Vec<Value> = if o.img == w.target {
+        inspect::referrers(w, w.target, &objs, o).into_iter().take(50).map(|(i, label)| {
+            let e = &objs[i];
+            json!({"offset": e.obj.off, "slot": label, "value": w.show(pkgimg_core::Val::Obj(e.obj), 3)})
+        }).collect()
+    } else { vec![] };
+    let v = json!({
+        "schema": "pkgimg/1", "command": "show",
+        "offset": o.off, "const": o.cst, "type": ty,
+        "value": w.show(pkgimg_core::Val::Obj(o), 4),
+        "string": inspect::string_value(w, o),
+        "fields": fields, "elements": elems, "referrers": refs,
+    });
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        return;
+    }
+    println!("{} @ {}{}  ::{}", v["value"].as_str().unwrap_or(""), if o.cst { "const+" } else { "" }, o.off, ty.unwrap_or_default());
+    if let Some(s) = v["string"].as_str() {
+        println!("  {:?}", s.chars().take(400).collect::<String>());
+    }
+    for f in &fields {
+        let loc = match (f["offset"].as_u64(), f["image"].as_str()) {
+            (Some(off), Some(img)) => format!("  [{img} @{off}]"),
+            (Some(off), None) => format!("  [@{}{off}]", if f["const"] == json!(true) { "const+" } else { "" }),
+            _ => String::new(),
+        };
+        println!("  {:<24} {}{}", f["name"].as_str().unwrap_or(""), f["value"].as_str().unwrap_or(""), loc);
+    }
+    if let Some(e) = &elems {
+        println!("elements ({})", e["length"]);
+        for (i, x) in e["first"].as_array().unwrap().iter().enumerate() {
+            println!("  [{}] {}", i + 1, x["value"].as_str().unwrap_or(""));
+        }
+    }
+    if !refs.is_empty() {
+        println!("referenced from");
+        for r in &refs {
+            println!("  @{:<10} {:<32} {}", r["offset"], r["slot"].as_str().unwrap_or(""), r["value"].as_str().unwrap_or(""));
+        }
+    }
 }
