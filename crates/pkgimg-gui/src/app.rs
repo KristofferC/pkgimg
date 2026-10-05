@@ -91,6 +91,7 @@ pub struct App {
     ci_group: CiGroup,
     ci_group_sel: Option<String>,
     ci_groups: Sorted,
+    ci_group_rows: Vec<(String, (u64, u64, u64, f32))>,
     ci_sort: Sorted,
     // methods
     m_filter: String,
@@ -127,6 +128,7 @@ impl App {
             ci_group: CiGroup::None,
             ci_group_sel: None,
             ci_groups: Sorted { col: 2, desc: true, ..Default::default() },
+            ci_group_rows: vec![],
             ci_sort: Sorted { col: 0, desc: true, ..Default::default() },
             m_filter: String::new(),
             m_sort: Sorted::default(),
@@ -202,7 +204,7 @@ impl App {
         self.history.clear();
         self.hist_pos = 0;
         self.referrers = None;
-        for s in [&mut self.heap_sort, &mut self.obj_rows, &mut self.ci_sort, &mut self.m_sort] {
+        for s in [&mut self.heap_sort, &mut self.obj_rows, &mut self.ci_sort, &mut self.m_sort, &mut self.ci_groups] {
             s.key.clear();
         }
     }
@@ -856,15 +858,18 @@ impl App {
 
     fn ci_group_table(&mut self, ui: &mut Ui, m: &Model) {
         let g = self.ci_group;
-        let mut groups: HashMap<String, (u64, u64, u64, f32)> = HashMap::new();
-        for c in &m.cis {
-            let e = groups.entry(ci_group_key(c, g)).or_default();
-            e.0 += 1;
-            e.1 += c.native_bytes + c.wrapper_bytes;
-            e.2 += c.inferred_bytes;
-            e.3 += c.infer_self_ms;
-        }
-        let rows: Vec<(String, (u64, u64, u64, f32))> = {
+        // Grouping is recomputed only when the grouping or sort changes; ties are broken by
+        // key so the order is stable.
+        let key = format!("{:?}|{}|{}", g, self.ci_groups.col, self.ci_groups.desc);
+        if self.ci_groups.key != key {
+            let mut groups: HashMap<String, (u64, u64, u64, f32)> = HashMap::new();
+            for c in &m.cis {
+                let e = groups.entry(ci_group_key(c, g)).or_default();
+                e.0 += 1;
+                e.1 += c.native_bytes + c.wrapper_bytes;
+                e.2 += c.inferred_bytes;
+                e.3 += c.infer_self_ms;
+            }
             let mut v: Vec<_> = groups.into_iter().collect();
             let (sc, desc) = (self.ci_groups.col, self.ci_groups.desc);
             v.sort_by(|a, b| {
@@ -875,10 +880,12 @@ impl App {
                     3 => a.1.2.cmp(&b.1.2),
                     _ => a.1.3.total_cmp(&b.1.3),
                 };
-                if desc { o.reverse() } else { o }
+                (if desc { o.reverse() } else { o }).then_with(|| a.0.cmp(&b.0))
             });
-            v
-        };
+            self.ci_group_rows = v;
+            self.ci_groups.key = key;
+        }
+        let rows = &self.ci_group_rows;
         ui.label(RichText::new(format!("{} groups", rows.len())).weak());
         let max = rows.iter().map(|r| r.1.1).max().unwrap_or(1).max(1);
         let color = bar_color(ui);

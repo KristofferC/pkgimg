@@ -134,6 +134,35 @@ mod shots {
         save(&mut h, "inspector");
     }
 
+    /// Grouped tables must not reorder between frames (run with --ignored).
+    #[test]
+    #[ignore]
+    fn group_table_is_stable() {
+        let file = std::env::var("PKGIMG_SHOT_FILE").expect("PKGIMG_SHOT_FILE");
+        let mut h = egui_kittest::Harness::builder()
+            .with_size([1500.0, 900.0])
+            .wgpu()
+            .build_eframe(|cc| app::App::new(cc, Some(app::Load::Paths(vec![file.clone().into()], None))));
+        for _ in 0..1200 {
+            h.step();
+            if h.state().is_ready() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        h.get_by_label("Code instances").click();
+        h.run_steps(3);
+        // Group by file and sort ascending by native size: the many ties are on screen.
+        h.get_by_label("file").click();
+        h.run_steps(3);
+        h.get_by_label("native ⏷").click();
+        h.run_steps(3);
+        let a = h.render().unwrap();
+        h.run_steps(5);
+        let b = h.render().unwrap();
+        assert!(a == b, "group table changed between frames");
+    }
+
     /// Render the file browser into `$PKGIMG_SHOT_DIR/browser.png` (run with --ignored).
     #[test]
     #[ignore]

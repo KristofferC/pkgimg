@@ -479,7 +479,7 @@ fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>
             CiSort::Inferred => b.inferred_bytes.cmp(&a.inferred_bytes),
             CiSort::InferTime => b.infer_self_ms.total_cmp(&a.infer_self_ms),
             CiSort::Name => a.key.cmp(&b.key),
-        }.then(b.code_instances.cmp(&a.code_instances)));
+        }.then(b.code_instances.cmp(&a.code_instances)).then_with(|| a.key.cmp(&b.key)));
         ctx.rows("compiled", image_id(w), &g, &[("code_instances", "CIs"), ("native_bytes", "native"), ("inferred_bytes", "inferred"), ("infer_self_ms", "infer ms"), ("key", "group")], extra);
         return;
     }
@@ -599,7 +599,10 @@ fn diff(ctx: &Ctx, a: &World, b: &World) -> Result<()> {
             cis.push(CiDelta { change: "removed", native_bytes: -(n as i64), inferred_bytes: -(i as i64), specialization: k.clone() });
         }
     }
-    cis.sort_by_key(|d| std::cmp::Reverse(d.native_bytes.abs() + d.inferred_bytes.abs()));
+    cis.sort_by(|a, b| {
+        (b.native_bytes.abs() + b.inferred_bytes.abs()).cmp(&(a.native_bytes.abs() + a.inferred_bytes.abs()))
+            .then_with(|| a.specialization.cmp(&b.specialization))
+    });
     #[derive(Serialize, Default)]
     struct MethodDelta { method: String, a_code_instances: i64, b_code_instances: i64, delta_code_instances: i64, delta_native_bytes: i64 }
     let mut md: std::collections::HashMap<String, MethodDelta> = Default::default();
@@ -613,7 +616,10 @@ fn diff(ctx: &Ctx, a: &World, b: &World) -> Result<()> {
     }
     let mut methods: Vec<MethodDelta> = md.into_values().map(|mut m| { m.delta_code_instances = m.b_code_instances - m.a_code_instances; m })
         .filter(|m| m.delta_code_instances != 0 || m.delta_native_bytes != 0).collect();
-    methods.sort_by_key(|m| (std::cmp::Reverse(m.delta_code_instances.abs()), std::cmp::Reverse(m.delta_native_bytes.abs())));
+    methods.sort_by(|a, b| {
+        (b.delta_code_instances.abs(), b.delta_native_bytes.abs()).cmp(&(a.delta_code_instances.abs(), a.delta_native_bytes.abs()))
+            .then_with(|| a.method.cmp(&b.method))
+    });
     let mut types: std::collections::BTreeMap<String, TypeDelta> = Default::default();
     for (h, is_b) in [(&ha, false), (&hb, true)] {
         for r in h.iter() {
@@ -622,7 +628,7 @@ fn diff(ctx: &Ctx, a: &World, b: &World) -> Result<()> {
         }
     }
     let mut types: Vec<TypeDelta> = types.into_values().filter(|t| t.a_bytes != t.b_bytes).map(|mut t| { t.delta_bytes = t.b_bytes as i64 - t.a_bytes as i64; t }).collect();
-    types.sort_by_key(|t| std::cmp::Reverse(t.delta_bytes.abs()));
+    types.sort_by(|a, b| b.delta_bytes.abs().cmp(&a.delta_bytes.abs()).then_with(|| a.key.cmp(&b.key)));
     let tot = |c: &[CiRow]| (c.len(), c.iter().map(|r| r.native_bytes + r.wrapper_bytes).sum::<u64>(), c.iter().map(|r| r.inferred_bytes).sum::<u64>());
     let (ta, tb) = (tot(&ca), tot(&cb));
     let heap = |w: &World| w.target().heap.data.len() as i64;
