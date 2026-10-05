@@ -39,6 +39,10 @@ fn is_native(p: &Path) -> bool {
     matches!(p.extension().and_then(|e| e.to_str()), Some("so" | "dylib" | "dll"))
 }
 
+fn maybe_decompress(b: Blob) -> Result<Blob> {
+    if b.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) { Ok(Blob::from_vec(decompress(&b)?)) } else { Ok(b) }
+}
+
 fn decompress(b: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut dec = ruzstd::decoding::StreamingDecoder::new(b).map_err(|e| anyhow::anyhow!("zstd: {e}"))?;
@@ -48,29 +52,46 @@ fn decompress(b: &[u8]) -> Result<Vec<u8>> {
 }
 
 impl Image {
-    /// Load from in-memory bytes (used by the web build). `native` is the optional native library.
-    pub fn from_bytes(path: PathBuf, ji: Blob, native_path: Option<PathBuf>, native: Option<Blob>) -> Result<Image> {
-        let (ji, native_buf) = match (header::parse_base(&ji), native) {
-            (Ok(_), n) => (ji, n),
-            (Err(_), None) if !ji.is_empty() => {
-                // Maybe `ji` is itself a native library with an embedded heap.
-                let (off, len) = native::embedded_image(&ji)?.context("no embedded image in native library")?;
-                (ji.slice(off, len)?, Some(ji))
-            }
-            (Err(e), _) => return Err(e),
-        };
+    /// Load from in-memory bytes (used by the web build). `bytes` is either a `.ji` (with
+    /// `native` its native library, if any) or a native library with an embedded heap.
+    pub fn from_bytes(path: PathBuf, bytes: Blob, native_path: Option<PathBuf>, native: Option<Blob>) -> Result<Image> {
+        if bytes.starts_with(header::JI_MAGIC) {
+            return Image::from_ji(path, bytes, native_path, native);
+        }
+        let (off, len) = native::embedded_image(&bytes)?.context("not a .ji file, and no embedded image in native library")?;
+        let emb = bytes.slice(off, len)?;
+        if emb.starts_with(header::JI_MAGIC) {
+            return Image::from_ji(path.clone(), emb, Some(path), Some(bytes));
+        }
+        // Headerless heap (1.13 system images), possibly zstd-compressed.
+        let (uname, arch) = native::platform(&bytes);
+        let header = header::raw_sysimage_header(&uname, &arch);
+        let heap_stored_size = emb.len();
+        let data = maybe_decompress(emb.clone())?;
+        let heap = Heap::parse(data, false, header.base.cache_align())?;
+        let native = Some(native::parse(&bytes)?);
+        Ok(Image { path: path.clone(), native_path: Some(path), header, ji: emb, heap, heap_stored_size, native })
+    }
+
+    fn from_ji(path: PathBuf, ji: Blob, native_path: Option<PathBuf>, native_buf: Option<Blob>) -> Result<Image> {
         let header = header::parse(&ji)?;
         let (ds, de) = (header.base.data_start as usize, header.base.data_end as usize);
-        if de > ji.len() || ds > de {
-            bail!("heap range {ds}..{de} exceeds file size {}", ji.len());
-        }
-        let stored = ji.slice(ds, de - ds)?;
-        let heap_stored_size = stored.len();
-        let data = if stored.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-            Blob::from_vec(decompress(&stored)?)
+        let stored = if ds > 0 && de > ds && de <= ji.len() {
+            ji.slice(ds, de - ds)?
         } else {
-            stored
+            // 1.13 split images keep the heap in the native library, behind its own header.
+            let n = native_buf.as_ref().context("the heap is stored in the native library, which was not found")?;
+            let (off, len) = native::embedded_image(n)?.context("no embedded image in native library")?;
+            let emb = n.slice(off, len)?;
+            let (h, _) = header::parse_base(&emb)?;
+            let (ds, de) = (h.data_start as usize, h.data_end as usize);
+            if de > emb.len() || ds > de {
+                bail!("heap range {ds}..{de} exceeds embedded image size {}", emb.len());
+            }
+            emb.slice(ds, de - ds)?
         };
+        let heap_stored_size = stored.len();
+        let data = maybe_decompress(stored)?;
         let heap = Heap::parse(data, header.base.is_pkgimage(), header.base.cache_align())?;
         let native = match native_buf {
             Some(n) => Some(native::parse(&n)?),
@@ -84,15 +105,15 @@ impl Image {
         let mut path = path.to_path_buf();
         if is_native(&path) {
             let buf = map_file(&path)?;
-            if let Some((off, len)) = native::embedded_image(&buf)? {
-                let ji = buf.slice(off, len)?;
-                return Image::from_bytes(path.clone(), ji, Some(path), Some(buf));
+            let sibling = path.with_extension("ji");
+            if native::embedded_image(&buf)?.is_some() && !sibling.exists() {
+                return Image::from_bytes(path, buf, None, None);
             }
-            // Split pkgimage: the heap lives in the sibling .ji
-            path = path.with_extension("ji");
+            // Pkgimage: open via the .ji (the native library is picked up next to it)
+            path = sibling;
         }
         let ji = map_file(&path)?;
-        let (base, _) = header::parse_base(&ji)?;
+        let (base, _) = header::parse_base(&ji).with_context(|| format!("reading {}", path.display()))?;
         let so = path.with_extension(DLEXT);
         let (native_path, native) = if so.exists() {
             (Some(so.clone()), Some(map_file(&so)?))

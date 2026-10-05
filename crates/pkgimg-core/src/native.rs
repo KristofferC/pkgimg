@@ -100,6 +100,24 @@ fn find_symbol(file: &object::File, name: &str) -> Option<u64> {
     Some(sym.address())
 }
 
+/// `(uname, arch)` of a native library, in the spelling of `JL_BUILD_UNAME`/`JL_BUILD_ARCH`.
+pub fn platform(buf: &[u8]) -> (String, String) {
+    let Ok(f) = object::File::parse(buf) else { return (String::new(), String::new()) };
+    let uname = match f.format() {
+        object::BinaryFormat::MachO => "Darwin",
+        object::BinaryFormat::Coff | object::BinaryFormat::Pe => "NT",
+        _ => "Linux",
+    };
+    let arch = match f.architecture() {
+        object::Architecture::X86_64 => "x86_64",
+        object::Architecture::Aarch64 => "aarch64",
+        object::Architecture::PowerPc64 => "ppc64le",
+        object::Architecture::Riscv64 => "riscv64",
+        a => return (uname.into(), format!("{a:?}").to_lowercase()),
+    };
+    (uname.into(), arch.into())
+}
+
 /// Bytes of the embedded image (`jl_system_image_data`), if this native image has one.
 pub fn embedded_image(buf: &[u8]) -> Result<Option<(usize, usize)>> {
     let file = object::File::parse(buf)?;

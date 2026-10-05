@@ -1000,20 +1000,9 @@ fn find_cache_file(
         use std::io::Read;
         let n = (&f).take(1 << 16).read(&mut buf).unwrap_or(0);
         buf.truncate(n);
-        let Ok((base, pos)) = crate::header::parse_base(&buf) else { continue };
-        let mut c = crate::bytes::Cursor::new(&buf, pos + 3);
-        // worklist entries: name, uuid, build_id.lo
-        let mut ok = false;
-        while let Ok(n) = c.i32() {
-            if n == 0 {
-                break;
-            }
-            let Ok(name) = c.lstr(n as usize) else { break };
-            let (Ok(_), Ok(_), Ok(lo)) = (c.u64(), c.u64(), c.u64()) else { break };
-            if name == m.name && lo == m.build_id_lo && (m.build_id_hi == 0 || m.build_id_hi == base.checksum as u64) {
-                ok = true;
-            }
-        }
+        let Ok((base, wl)) = crate::header::parse_worklist(&buf) else { continue };
+        let ok = wl.iter().any(|w| w.name == m.name && w.uuid == m.uuid && w.build_id_lo == m.build_id_lo)
+            && (m.build_id_hi == 0 || m.build_id_hi == base.checksum);
         if ok {
             return Some(p.clone());
         }
@@ -1062,10 +1051,17 @@ fn sysimage_candidates(img: &Image) -> Vec<PathBuf> {
         if let Ok(f) = std::fs::File::open(&c)
             && let Ok(m) = unsafe { memmap2::Mmap::map(&f) }
             && let Ok(Some((off, len))) = crate::native::embedded_image(&m)
-            && let Ok((h, _)) = crate::header::parse_base(&m[off..off + len.min(4096)])
-            && &h.julia_version == want
         {
-            out.push(c);
+            // Images with a header must match the version; headerless (1.13) ones are
+            // checked later through the Core build id.
+            let emb = &m[off..off + len.min(4096)];
+            let ok = match crate::header::parse_base(emb) {
+                Ok((h, _)) => &h.julia_version == want,
+                Err(_) => !emb.starts_with(crate::header::JI_MAGIC),
+            };
+            if ok {
+                out.push(c);
+            }
         }
     }
     out

@@ -61,9 +61,11 @@ pub struct BaseHeader {
     pub flags: u32,
     pub git_branch: Option<String>,
     pub git_commit: Option<String>,
-    pub checksum: u32,
+    pub checksum: u64,
     pub data_start: u64,
     pub data_end: u64,
+    /// 1.13 split images: this is the header copy embedded in the native library.
+    pub native_header: bool,
 }
 
 impl BaseHeader {
@@ -133,12 +135,18 @@ fn read_module_list(c: &mut Cursor, has_hi: bool) -> Result<Vec<ModuleId>> {
     }
 }
 
+/// Header formats this reader understands: 16 (master), 12 (1.13).
+pub const SUPPORTED_FORMATS: &[u16] = &[12, 16];
+
 pub fn parse_base(buf: &[u8]) -> Result<(BaseHeader, usize)> {
     if !buf.starts_with(JI_MAGIC) {
         bail!("not a Julia image (bad magic)");
     }
     let mut c = Cursor::new(buf, JI_MAGIC.len());
     let format_version = c.u16()?;
+    if !SUPPORTED_FORMATS.contains(&format_version) {
+        bail!("unsupported image format version {format_version} (supported: {SUPPORTED_FORMATS:?})");
+    }
     let bom = c.u16()?;
     if bom != 0xFEFF {
         bail!("unsupported byte order");
@@ -150,21 +158,55 @@ pub fn parse_base(buf: &[u8]) -> Result<(BaseHeader, usize)> {
     let uname = c.cstr()?;
     let arch = c.cstr()?;
     let julia_version = c.cstr()?;
-    let gc_abi = c.cstr()?;
-    let flags = c.u32()?;
-    let (git_branch, git_commit) = if flags & JI_FLAG_PKGIMAGE != 0 {
-        (Some(c.cstr()?), Some(c.cstr()?))
+    let h = if format_version >= 16 {
+        let gc_abi = c.cstr()?;
+        let flags = c.u32()?;
+        let (git_branch, git_commit) = if flags & JI_FLAG_PKGIMAGE != 0 {
+            (Some(c.cstr()?), Some(c.cstr()?))
+        } else {
+            (None, None)
+        };
+        let checksum = c.u32()? as u64;
+        BaseHeader {
+            format_version, ptr_size, uname, arch, julia_version, gc_abi, flags,
+            git_branch, git_commit, checksum, data_start: c.u64()?, data_end: c.u64()?,
+            native_header: false,
+        }
     } else {
-        (None, None)
-    };
-    let checksum = c.u32()?;
-    let data_start = c.u64()?;
-    let data_end = c.u64()?;
-    let h = BaseHeader {
-        format_version, ptr_size, uname, arch, julia_version, gc_abi, flags,
-        git_branch, git_commit, checksum, data_start, data_end,
+        // 1.13: only incremental images have a header. The `.ji` carries pkgimage=0, the
+        // copy embedded in the native library pkgimage=1 (followed by flags + module list).
+        let git_branch = Some(c.cstr()?);
+        let git_commit = Some(c.cstr()?);
+        let native_header = c.u8()? != 0;
+        let checksum = c.u64()?;
+        BaseHeader {
+            format_version, ptr_size, uname, arch, julia_version, gc_abi: String::new(),
+            flags: JI_FLAG_PKGIMAGE, git_branch, git_commit, checksum,
+            data_start: c.u64()?, data_end: c.u64()?, native_header,
+        }
     };
     Ok((h, c.pos))
+}
+
+/// Base header plus the worklist, reading as little as possible (for cache-file lookup).
+pub fn parse_worklist(buf: &[u8]) -> Result<(BaseHeader, Vec<ModuleId>)> {
+    let (base, pos) = parse_base(buf)?;
+    let skip = if base.format_version >= 16 { 3 } else { 1 };
+    let mut c = Cursor::new(buf, pos + skip);
+    let wl = read_module_list(&mut c, false)?;
+    Ok((base, wl))
+}
+
+/// Synthesized header for a headerless (1.13) system image heap.
+pub fn raw_sysimage_header(uname: &str, arch: &str) -> Header {
+    Header {
+        base: BaseHeader {
+            format_version: 0, ptr_size: 8, uname: uname.into(), arch: arch.into(),
+            julia_version: String::new(), gc_abi: String::new(), flags: 0, git_branch: None,
+            git_commit: None, checksum: 0, data_start: 0, data_end: 0, native_header: false,
+        },
+        pkg: None,
+    }
 }
 
 pub fn parse(buf: &[u8]) -> Result<Header> {
@@ -174,8 +216,7 @@ pub fn parse(buf: &[u8]) -> Result<Header> {
     }
     let mut c = Cursor::new(buf, pos);
     let cache_flags = CacheFlags::new(c.u8()?);
-    let coverage = c.u8()?;
-    let syntax_version = c.u8()?;
+    let (coverage, syntax_version) = if base.format_version >= 16 { (c.u8()?, c.u8()?) } else { (0, 0) };
     let worklist = read_module_list(&mut c, false)?;
     let _totbytes = c.u64()?;
     let mut includes = Vec::new();
