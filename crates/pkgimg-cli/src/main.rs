@@ -56,6 +56,18 @@ enum Cmd {
     },
     /// Methods defined in the image.
     Methods { file: PathBuf },
+    /// List individual objects.
+    Objects {
+        file: PathBuf,
+        /// Only objects whose type name contains this string (e.g. `Module`, `Base.Dict`).
+        #[arg(long = "type")]
+        ty: Option<String>,
+    },
+    /// Compare two images (e.g. before/after a change): code instances and heap by type.
+    Diff {
+        a: PathBuf,
+        b: PathBuf,
+    },
     /// Required modules and where they were resolved.
     Deps { file: PathBuf },
     /// Source files embedded in the cache file.
@@ -223,8 +235,13 @@ fn heap_hist(w: &World, objs: &[ObjEntry], cst: &[ObjEntry], by: HeapBy, section
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let ctx = Ctx { json: cli.json, limit: cli.limit };
+    if let Cmd::Diff { a, b } = &cli.cmd {
+        let open = |p: &PathBuf| World::open(p, Options { sysimage: cli.sysimage.clone(), depots: cli.depots.clone(), verbose: cli.verbose });
+        return diff(&ctx, &open(a)?, &open(b)?);
+    }
     let file = match &cli.cmd {
-        Cmd::Summary { file } | Cmd::Heap { file, .. } | Cmd::Compiled { file, .. } | Cmd::Methods { file }
+        Cmd::Diff { .. } => unreachable!(),
+        Cmd::Summary { file } | Cmd::Heap { file, .. } | Cmd::Compiled { file, .. } | Cmd::Methods { file } | Cmd::Objects { file, .. }
         | Cmd::Deps { file } | Cmd::Sources { file, .. } => file.clone(),
     };
     let t0 = Instant::now();
@@ -247,6 +264,22 @@ fn main() -> Result<()> {
             ctx.rows("methods", &w, &rows, &[("module", "module"), ("name", "name"), ("sig", "signature"), ("file", "file"), ("line", "line")], json!({}));
         }
         Cmd::Deps { .. } => deps(&ctx, &w),
+        Cmd::Diff { .. } => unreachable!(),
+        Cmd::Objects { ty, .. } => {
+            let (objs, cst) = tables(&w);
+            let mut rows = vec![];
+            for e in objs.iter().chain(&cst) {
+                let t = analysis::type_key(&w, e, false);
+                if ty.as_ref().is_some_and(|f| !t.contains(f.as_str())) {
+                    continue;
+                }
+                rows.push(json!({
+                    "offset": e.obj.off, "section": if e.obj.cst { "const" } else { "objects" },
+                    "size": e.size, "type": t, "value": w.show(pkgimg_core::Val::Obj(e.obj), 3),
+                }));
+            }
+            ctx.rows("objects", &w, &rows, &[("section", "section"), ("offset", "offset"), ("size", "size"), ("type", "type"), ("value", "value")], json!({}));
+        }
         Cmd::Sources { show, .. } => {
             let src = w.target().srctext();
             if let Some(s) = show {
@@ -438,4 +471,145 @@ fn deps(ctx: &Ctx, w: &World) {
         })
         .collect();
     ctx.rows("deps", w, &rows, &[("name", "module"), ("location", "location")], json!({}));
+}
+
+/// Drop gensym counters (`#foo#123` -> `#foo#`) so keys are stable across builds.
+fn degensym(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        out.push(c);
+        if c == '#' {
+            while it.peek().is_some_and(|d| d.is_ascii_digit()) {
+                it.next();
+            }
+        }
+    }
+    out
+}
+
+fn ci_key(r: &CiRow) -> String {
+    let owner = if r.owner == "nothing" { String::new() } else { format!(" [owner {}]", r.owner) };
+    degensym(&format!("{}.{}{}{}", r.module, r.method, r.spec, owner))
+}
+
+fn method_key(r: &CiRow) -> String {
+    degensym(&format!("{}.{}", r.module, r.method))
+}
+
+#[derive(Serialize)]
+struct CiDelta {
+    change: &'static str,
+    native_bytes: i64,
+    inferred_bytes: i64,
+    specialization: String,
+}
+
+#[derive(Serialize)]
+struct TypeDelta {
+    key: String,
+    a_bytes: u64,
+    b_bytes: u64,
+    delta_bytes: i64,
+    a_count: u64,
+    b_count: u64,
+}
+
+fn diff(ctx: &Ctx, a: &World, b: &World) -> Result<()> {
+    let load = |w: &World| {
+        let (objs, cst) = tables(w);
+        let cis = analysis::code_instances(w, w.target, &objs);
+        let hist = heap_hist(w, &objs, &cst, HeapBy::Type, Section::All);
+        (cis, hist, objs.len() + cst.len())
+    };
+    let (ca, ha, na) = load(a);
+    let (cb, hb, nb) = load(b);
+    let mut ma: std::collections::HashMap<String, (u64, u64)> = Default::default();
+    for r in &ca {
+        let e = ma.entry(ci_key(r)).or_default();
+        e.0 += r.native_bytes + r.wrapper_bytes;
+        e.1 += r.inferred_bytes;
+    }
+    let mut mb: std::collections::HashMap<String, (u64, u64)> = Default::default();
+    for r in &cb {
+        let e = mb.entry(ci_key(r)).or_default();
+        e.0 += r.native_bytes + r.wrapper_bytes;
+        e.1 += r.inferred_bytes;
+    }
+    let mut cis = vec![];
+    for (k, &(n, i)) in &mb {
+        match ma.get(k) {
+            None => cis.push(CiDelta { change: "added", native_bytes: n as i64, inferred_bytes: i as i64, specialization: k.clone() }),
+            Some(&(n0, i0)) if (n0, i0) != (n, i) => cis.push(CiDelta { change: "changed", native_bytes: n as i64 - n0 as i64, inferred_bytes: i as i64 - i0 as i64, specialization: k.clone() }),
+            _ => {}
+        }
+    }
+    for (k, &(n, i)) in &ma {
+        if !mb.contains_key(k) {
+            cis.push(CiDelta { change: "removed", native_bytes: -(n as i64), inferred_bytes: -(i as i64), specialization: k.clone() });
+        }
+    }
+    cis.sort_by_key(|d| std::cmp::Reverse(d.native_bytes.abs() + d.inferred_bytes.abs()));
+    #[derive(Serialize, Default)]
+    struct MethodDelta { method: String, a_code_instances: i64, b_code_instances: i64, delta_code_instances: i64, delta_native_bytes: i64 }
+    let mut md: std::collections::HashMap<String, MethodDelta> = Default::default();
+    for (rows, sign) in [(&ca, -1i64), (&cb, 1)] {
+        for r in rows.iter() {
+            let k = method_key(r);
+            let e = md.entry(k.clone()).or_insert_with(|| MethodDelta { method: k, ..Default::default() });
+            if sign < 0 { e.a_code_instances += 1 } else { e.b_code_instances += 1 }
+            e.delta_native_bytes += sign * (r.native_bytes + r.wrapper_bytes) as i64;
+        }
+    }
+    let mut methods: Vec<MethodDelta> = md.into_values().map(|mut m| { m.delta_code_instances = m.b_code_instances - m.a_code_instances; m })
+        .filter(|m| m.delta_code_instances != 0 || m.delta_native_bytes != 0).collect();
+    methods.sort_by_key(|m| (std::cmp::Reverse(m.delta_code_instances.abs()), std::cmp::Reverse(m.delta_native_bytes.abs())));
+    let mut types: std::collections::BTreeMap<String, TypeDelta> = Default::default();
+    for (h, is_b) in [(&ha, false), (&hb, true)] {
+        for r in h.iter() {
+            let t = types.entry(r.key.clone()).or_insert_with(|| TypeDelta { key: r.key.clone(), a_bytes: 0, b_bytes: 0, delta_bytes: 0, a_count: 0, b_count: 0 });
+            if is_b { t.b_bytes += r.bytes; t.b_count += r.count; } else { t.a_bytes += r.bytes; t.a_count += r.count; }
+        }
+    }
+    let mut types: Vec<TypeDelta> = types.into_values().filter(|t| t.a_bytes != t.b_bytes).map(|mut t| { t.delta_bytes = t.b_bytes as i64 - t.a_bytes as i64; t }).collect();
+    types.sort_by_key(|t| std::cmp::Reverse(t.delta_bytes.abs()));
+    let tot = |c: &[CiRow]| (c.len(), c.iter().map(|r| r.native_bytes + r.wrapper_bytes).sum::<u64>(), c.iter().map(|r| r.inferred_bytes).sum::<u64>());
+    let (ta, tb) = (tot(&ca), tot(&cb));
+    let heap = |w: &World| w.target().heap.data.len() as i64;
+    let summary = json!({
+        "code_instances": {"a": ta.0, "b": tb.0, "delta": tb.0 as i64 - ta.0 as i64},
+        "native_bytes": {"a": ta.1, "b": tb.1, "delta": tb.1 as i64 - ta.1 as i64},
+        "inferred_bytes": {"a": ta.2, "b": tb.2, "delta": tb.2 as i64 - ta.2 as i64},
+        "heap_bytes": {"a": heap(a), "b": heap(b), "delta": heap(b) - heap(a)},
+        "objects": {"a": na, "b": nb, "delta": nb as i64 - na as i64},
+        "code_instances_added": cis.iter().filter(|c| c.change == "added").count(),
+        "code_instances_removed": cis.iter().filter(|c| c.change == "removed").count(),
+    });
+    let lim = |n: usize| if ctx.limit == 0 { n } else { n.min(ctx.limit) };
+    if ctx.json {
+        let v = json!({
+            "schema": "pkgimg/1", "command": "diff",
+            "a": image_id(a), "b": image_id(b), "summary": summary,
+            "methods": &methods[..lim(methods.len())], "methods_total": methods.len(),
+            "code_instances": &cis[..lim(cis.len())], "code_instances_total": cis.len(),
+            "types": &types[..lim(types.len())], "types_total": types.len(),
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        return Ok(());
+    }
+    println!("a: {}\nb: {}", a.target().path.display(), b.target().path.display());
+    for k in ["code_instances", "native_bytes", "inferred_bytes", "heap_bytes", "objects"] {
+        let s = &summary[k];
+        println!("  {k:<16} {:>12} -> {:>12}  ({:+})", s["a"], s["b"], s["delta"].as_i64().unwrap_or(0));
+    }
+    println!("\nby method");
+    let rows: Vec<Value> = methods[..lim(methods.len())].iter().map(|c| serde_json::to_value(c).unwrap()).collect();
+    print_table(&rows, &[("delta_code_instances", "ΔCIs"), ("a_code_instances", "a"), ("b_code_instances", "b"), ("delta_native_bytes", "Δnative"), ("method", "method")]);
+    println!("\ncode instances ({} added, {} removed)", summary["code_instances_added"], summary["code_instances_removed"]);
+    let rows: Vec<Value> = cis[..lim(cis.len())].iter().map(|c| serde_json::to_value(c).unwrap()).collect();
+    print_table(&rows, &[("change", "change"), ("native_bytes", "native"), ("inferred_bytes", "inferred"), ("specialization", "specialization")]);
+    println!("\nheap by type");
+    let rows: Vec<Value> = types[..lim(types.len())].iter().map(|c| serde_json::to_value(c).unwrap()).collect();
+    print_table(&rows, &[("delta_bytes", "delta"), ("a_bytes", "a"), ("b_bytes", "b"), ("key", "type")]);
+    Ok(())
 }

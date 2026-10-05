@@ -185,31 +185,11 @@ impl World {
         if opts.depots.is_empty() {
             opts.depots = default_depots();
         }
-        let mut images = vec![target_img];
-        let sysimg_path = opts.sysimage.clone().or_else(|| guess_sysimage(&images[0], &opts.depots));
-        let mut sysimg = None;
-        if images[0].header.pkg.is_none() {
-            sysimg = Some(0);
-        } else if let Some(p) = sysimg_path {
-            if opts.verbose {
-                eprintln!("loading system image {}", p.display());
-            }
-            images.push(Image::open(&p).with_context(|| format!("loading system image {}", p.display()))?);
-            sysimg = Some(1);
-        } else {
-            eprintln!("warning: no system image found (use --sysimage); external references stay unresolved");
-        }
-        // stdlib caches live next to the system image: <prefix>/share/julia/compiled
-        if let Some(s) = sysimg {
-            let p = &images[s as usize].path;
-            if let Some(prefix) = p.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
-                opts.depots.push(prefix.join("share").join("julia"));
-            }
-        }
+        let is_sys = target_img.header.pkg.is_none();
         let mut w = World {
-            images,
+            images: vec![target_img],
             deps: vec![],
-            sysimg,
+            sysimg: is_sys.then_some(0),
             target: 0,
             missing: vec![],
             types: RefCell::default(),
@@ -218,10 +198,65 @@ impl World {
             datatype_type: None,
             core_types: HashMap::new(),
         };
+        if !is_sys {
+            let cands = match &opts.sysimage {
+                Some(p) => vec![p.clone()],
+                None => sysimage_candidates(&w.images[0]),
+            };
+            for p in cands {
+                match w.try_sysimage(&p, opts.sysimage.is_some()) {
+                    Ok(true) => {
+                        if opts.verbose {
+                            eprintln!("using system image {}", p.display());
+                        }
+                        break;
+                    }
+                    Ok(false) => {
+                        if opts.verbose {
+                            eprintln!("skipping {}: Core build id does not match", p.display());
+                        }
+                    }
+                    Err(e) => eprintln!("warning: {}: {e:#}", p.display()),
+                }
+            }
+            if w.sysimg.is_none() {
+                eprintln!("warning: no matching system image found (use --sysimage); external references stay unresolved");
+            }
+        } else {
+            w.index_sysimage();
+        }
+        // stdlib caches live next to the system image: <prefix>/share/julia/compiled
+        if let Some(s) = w.sysimg {
+            let p = &w.images[s as usize].path;
+            if let Some(prefix) = p.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+                opts.depots.push(prefix.join("share").join("julia"));
+            }
+        }
         w.deps = vec![vec![]; w.images.len()];
-        w.index_sysimage();
         w.resolve_deps(&opts)?;
         Ok(w)
+    }
+
+    /// Load `p` as the system image if its `Core` matches the target's (or `force`).
+    fn try_sysimage(&mut self, p: &Path, force: bool) -> Result<bool> {
+        let im = Image::open(p)?;
+        if im.header.pkg.is_some() {
+            anyhow::bail!("not a system image");
+        }
+        self.images.push(im);
+        let id = (self.images.len() - 1) as ImgId;
+        self.sysimg = Some(id);
+        self.index_sysimage();
+        let want = self.images[0].header.pkg.as_ref().and_then(|p| p.required_modules.iter().find(|m| m.name == "Core")).map(|m| m.build_id_lo);
+        let have = self.toplevel_modules(id).into_iter().find(|m| m.0 == "Core").map(|m| m.3);
+        if force || want.is_none() || want == have {
+            return Ok(true);
+        }
+        self.images.pop();
+        self.sysimg = None;
+        self.types.borrow_mut().clear();
+        self.modpaths.borrow_mut().clear();
+        Ok(false)
     }
 
     pub fn img(&self, id: ImgId) -> &Image {
@@ -882,41 +917,51 @@ fn find_cache_file(
     None
 }
 
-/// Guess the system image matching a package image.
-fn guess_sysimage(img: &Image, _depots: &[PathBuf]) -> Option<PathBuf> {
+/// Candidate system images for a package image, most likely first.
+fn sysimage_candidates(img: &Image) -> Vec<PathBuf> {
+    let so = format!("sys.{}", crate::image::DLEXT);
+    let mut prefixes: Vec<PathBuf> = vec![];
     if let Ok(p) = std::env::var("JULIA_SYSIMAGE") {
-        return Some(PathBuf::from(p));
+        return vec![PathBuf::from(p)];
     }
-    // stdlib caches: <prefix>/share/julia/compiled/vX.Y/<Name>/<file>.ji -> <prefix>/lib/julia/sys.<dlext>
-    let mut cands = vec![];
+    // stdlib caches: <prefix>/share/julia/compiled/vX.Y/<Name>/<file>.ji
     if let Some(prefix) = img.path.ancestors().nth(6) {
-        cands.push(prefix.join("lib").join("julia").join(format!("sys.{}", crate::image::DLEXT)));
+        prefixes.push(prefix.to_path_buf());
     }
-    // `julia` on PATH
     if let Ok(path) = std::env::var("PATH") {
         for d in path.split(':') {
-            let j = Path::new(d).join("julia");
-            if let Ok(real) = std::fs::canonicalize(&j)
+            if let Ok(real) = std::fs::canonicalize(Path::new(d).join("julia"))
                 && let Some(prefix) = real.parent().and_then(|p| p.parent())
             {
-                cands.push(prefix.join("lib").join("julia").join(format!("sys.{}", crate::image::DLEXT)));
+                prefixes.push(prefix.to_path_buf());
             }
         }
     }
-    let want = &img.header.base;
-    for c in cands {
-        if !c.exists() {
+    if let Ok(cwd) = std::env::current_dir() {
+        prefixes.push(cwd.join("usr"));
+    }
+    // juliaup installations
+    if let Some(h) = std::env::var_os("HOME")
+        && let Ok(rd) = std::fs::read_dir(Path::new(&h).join(".julia").join("juliaup"))
+    {
+        prefixes.extend(rd.flatten().map(|e| e.path()));
+    }
+    let want = &img.header.base.julia_version;
+    let mut out = vec![];
+    for prefix in prefixes {
+        let c = prefix.join("lib").join("julia").join(&so);
+        if out.contains(&c) || !c.exists() {
             continue;
         }
-        // Check the version string inside the embedded image header.
+        // Cheap pre-filter on the version string in the embedded header.
         if let Ok(f) = std::fs::File::open(&c)
             && let Ok(m) = unsafe { memmap2::Mmap::map(&f) }
             && let Ok(Some((off, len))) = crate::native::embedded_image(&m)
             && let Ok((h, _)) = crate::header::parse_base(&m[off..off + len.min(4096)])
-            && h.julia_version == want.julia_version
+            && &h.julia_version == want
         {
-            return Some(c);
+            out.push(c);
         }
     }
-    None
+    out
 }

@@ -143,7 +143,7 @@ fn read_u32s(c: &mut Cursor) -> Result<Vec<u32>> {
 }
 
 impl Heap {
-    pub fn parse(data: Blob, incremental: bool) -> Result<Heap> {
+    pub fn parse(data: Blob, incremental: bool, cache_align: usize) -> Result<Heap> {
         let buf: &[u8] = &data;
         let mut c = Cursor::new(buf, 0);
         // The object section is written with skip=8: its size word occupies the first 8
@@ -152,7 +152,7 @@ impl Heap {
         let (sys_start, sys_payload) = read_section(&mut c, 1)?;
         debug_assert_eq!(sys_start, sys_base + 8);
         let sys_len = sys_payload + 8;
-        let (const_base, const_len) = read_section(&mut c, 128)?;
+        let (const_base, const_len) = read_section(&mut c, cache_align)?;
         let (sym_start, sym_len) = read_section(&mut c, 8)?;
         let (rel_start, rel_len) = read_section(&mut c, 8)?;
         let (gv_start, gv_len) = read_section(&mut c, 8)?;

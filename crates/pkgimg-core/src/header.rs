@@ -70,6 +70,15 @@ impl BaseHeader {
     pub fn is_pkgimage(&self) -> bool {
         self.flags & JI_FLAG_PKGIMAGE != 0
     }
+    /// `JL_CACHE_BYTE_ALIGNMENT` of the platform that wrote the image.
+    pub fn cache_align(&self) -> usize {
+        let arch = self.arch.to_ascii_lowercase();
+        if (arch == "aarch64" || arch == "arm64") && self.uname == "Darwin" || arch.starts_with("ppc64") {
+            128
+        } else {
+            64
+        }
+    }
     /// "1.14.0-DEV" -> (1, 14)
     pub fn major_minor(&self) -> Option<(u32, u32)> {
         let mut it = self.julia_version.split(['.', '-', '+']);

@@ -65,7 +65,7 @@ impl Image {
         } else {
             stored
         };
-        let heap = Heap::parse(data, header.base.is_pkgimage())?;
+        let heap = Heap::parse(data, header.base.is_pkgimage(), header.base.cache_align())?;
         let native = match native_buf {
             Some(n) => Some(native::parse(&n)?),
             None => None,
