@@ -28,9 +28,11 @@ pub enum ConstLabel {
 pub fn object_table(w: &World, img: ImgId) -> Vec<ObjEntry> {
     let heap = &w.img(img).heap;
     let n = heap.gctags.len();
+    let mut tags = heap.gctags.clone();
+    tags.sort_unstable();
     let mut starts = Vec::with_capacity(n);
     let mut out = Vec::with_capacity(n);
-    for &p in &heap.gctags {
+    for &p in &tags {
         let obj = Obj { img, cst: false, off: p + 8 };
         let ty = w.type_of(obj);
         let has_id = ty.and_then(|t| w.datatype(t)).is_some_and(|t| t.has_object_id());
@@ -389,11 +391,10 @@ pub fn slot_label(w: &World, e: &ObjEntry, pos: u32) -> String {
 pub fn first_referrers(w: &World, img: ImgId, objs: &[ObjEntry]) -> HashMap<Obj, (usize, u32)> {
     let heap = &w.img(img).heap;
     let mut out: HashMap<Obj, (usize, u32)> = HashMap::with_capacity(heap.relocs.len());
-    let mut oi = 0;
-    for &p in &heap.relocs {
-        while oi + 1 < objs.len() && objs[oi + 1].obj.off <= p + 8 {
-            oi += 1;
-        }
+    let mut relocs = heap.relocs.clone();
+    relocs.sort_unstable();
+    for &p in &relocs {
+        let oi = objs.partition_point(|e| e.obj.off <= p + 8).saturating_sub(1);
         if let Val::Obj(t) = w.decode_at(img, p as usize)
             && t.img == img
         {

@@ -158,6 +158,14 @@ pub fn parse_base(buf: &[u8]) -> Result<(BaseHeader, usize)> {
     let uname = c.cstr()?;
     let arch = c.cstr()?;
     let julia_version = c.cstr()?;
+    if format_version == 12 {
+        // 1.12 shares the format number with 1.13 but differs in layout.
+        let mut it = julia_version.split(['.', '-', '+']);
+        let mm: (u32, u32) = (it.next().and_then(|x| x.parse().ok()).unwrap_or(0), it.next().and_then(|x| x.parse().ok()).unwrap_or(0));
+        if mm < (1, 13) {
+            bail!("Julia {julia_version} images are not supported (supported: 1.13 and master)");
+        }
+    }
     let h = if format_version >= 16 {
         let gc_abi = c.cstr()?;
         let flags = c.u32()?;

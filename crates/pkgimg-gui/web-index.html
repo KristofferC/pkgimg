@@ -4,7 +4,6 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pkgimg</title>
-  <link data-trunk rel="rust" data-bin="pkgimg-gui" />
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1b1b; }
     canvas { width: 100%; height: 100%; display: block; }
@@ -12,5 +11,9 @@
 </head>
 <body>
   <canvas id="the_canvas_id"></canvas>
+  <script type="module">
+    import init from "./pkgimg-gui.js";
+    init();
+  </script>
 </body>
 </html>

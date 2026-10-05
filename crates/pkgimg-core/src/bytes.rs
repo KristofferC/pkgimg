@@ -1,6 +1,6 @@
 //! Little-endian cursor over a byte slice.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 pub struct Cursor<'a> {
     pub buf: &'a [u8],
@@ -77,7 +77,9 @@ pub fn rd_u16(buf: &[u8], off: usize) -> u16 {
     buf.get(off..off + 2).map_or(0, |b| u16::from_le_bytes(b.try_into().unwrap()))
 }
 
-/// Decode a 0-terminated list of LEB128-style deltas (`jl_write_offsetlist`).
+/// Decode a 0-terminated list of LEB128-style deltas (`jl_write_offsetlist`). Lists are not
+/// necessarily sorted: a backwards step is written as a wrapped (10-byte) delta, and the
+/// loader adds deltas with wrapping arithmetic, as done here.
 pub fn read_offsetlist(buf: &[u8], pos: &mut usize) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     let mut last: u64 = 0;
@@ -87,6 +89,9 @@ pub fn read_offsetlist(buf: &[u8], pos: &mut usize) -> Result<Vec<u32>> {
         loop {
             let Some(&c) = buf.get(*pos) else { bail!("truncated offset list") };
             *pos += 1;
+            if shift >= 64 {
+                bail!("corrupt offset list");
+            }
             d |= ((c & 0x7f) as u64) << shift;
             shift += 7;
             if c & 0x80 == 0 {
@@ -96,7 +101,7 @@ pub fn read_offsetlist(buf: &[u8], pos: &mut usize) -> Result<Vec<u32>> {
         if d == 0 {
             return Ok(out);
         }
-        last += d;
-        out.push(u32::try_from(last)?);
+        last = last.wrapping_add(d);
+        out.push(u32::try_from(last).context("corrupt offset list")?);
     }
 }

@@ -206,7 +206,11 @@ impl World {
                             eprintln!("skipping {}: Core build id does not match", p.display());
                         }
                     }
-                    Err(e) => eprintln!("warning: {}: {e:#}", p.display()),
+                    Err(e) => {
+                        if opts.verbose || opts.sysimage.is_some() {
+                            eprintln!("warning: {}: {e:#}", p.display());
+                        }
+                    }
                 }
             }
             if w.sysimg.is_none() {
@@ -288,6 +292,9 @@ impl World {
         self.sysimg = None;
         self.types.lock().unwrap().clear();
         self.modpaths.lock().unwrap().clear();
+        self.smalltags = vec![None; 64];
+        self.core_types.clear();
+        self.datatype_type = None;
         false
     }
 
@@ -515,7 +522,7 @@ impl World {
     pub fn word(&self, o: Obj, at: u32) -> u64 {
         let heap = &self.img(o.img).heap;
         let buf = if o.cst { heap.cdata() } else { heap.sys() };
-        rd_u64(buf, (o.off + at) as usize)
+        rd_u64(buf, o.off as usize + at as usize)
     }
 
     /// Pointer field at byte offset `at` of object `o`.
@@ -524,13 +531,13 @@ impl World {
             // Constant data holds no pointers to relocate except via smalltags.
             return Val::Null;
         }
-        self.decode_at(o.img, (o.off + at) as usize)
+        self.decode_at(o.img, o.off as usize + at as usize)
     }
 
     pub fn bytes(&self, o: Obj, at: u32, len: u32) -> &[u8] {
         let heap = &self.img(o.img).heap;
         let buf = if o.cst { heap.cdata() } else { heap.sys() };
-        let s = (o.off + at) as usize;
+        let s = o.off as usize + at as usize;
         buf.get(s..s + len as usize).unwrap_or(&[])
     }
 
@@ -645,7 +652,13 @@ impl World {
             2 => (8, 4),
             _ => return Some(Layout { size, nfields, npointers, first_ptr, alignment, flags, ..Default::default() }),
         };
+        if nfields > 1 << 16 || npointers > 1 << 20 {
+            return None;
+        }
         let fb = self.bytes(l, 20, nfields * fsz);
+        if fb.len() < (nfields * fsz) as usize {
+            return None;
+        }
         for i in 0..nfields as usize {
             let (isptr, size, offset) = match fdt {
                 0 => (fb[2 * i] & 1 != 0, (fb[2 * i] >> 1) as u32, fb[2 * i + 1] as u32),
@@ -1013,41 +1026,18 @@ fn find_cache_file(
 /// Candidate system images for a package image, most likely first.
 #[cfg(not(target_arch = "wasm32"))]
 fn sysimage_candidates(img: &Image) -> Vec<PathBuf> {
-    let so = format!("sys.{}", crate::image::DLEXT);
     let mut prefixes: Vec<PathBuf> = vec![];
     // stdlib caches: <prefix>/share/julia/compiled/vX.Y/<Name>/<file>.ji
     if let Some(prefix) = img.path.ancestors().nth(6) {
         prefixes.push(prefix.to_path_buf());
     }
-    if let Ok(path) = std::env::var("PATH") {
-        for d in path.split(':') {
-            if let Ok(real) = std::fs::canonicalize(Path::new(d).join("julia"))
-                && let Some(prefix) = real.parent().and_then(|p| p.parent())
-            {
-                prefixes.push(prefix.to_path_buf());
-            }
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        prefixes.push(cwd.join("usr"));
-    }
-    // juliaup installations
-    if let Some(h) = std::env::var_os("HOME")
-        && let Ok(rd) = std::fs::read_dir(Path::new(&h).join(".julia").join("juliaup"))
-    {
-        prefixes.extend(rd.flatten().map(|e| e.path()));
-    }
+    prefixes.extend(crate::discover::installs());
     let want = &img.header.base.julia_version;
-    let mut out = vec![];
-    // An explicit hint is tried first but still has to match the Core build id.
-    if let Ok(p) = std::env::var("JULIA_SYSIMAGE")
-        && !p.is_empty()
-    {
-        out.push(PathBuf::from(p));
-    }
+    let ji_time = std::fs::metadata(&img.path).and_then(|m| m.modified()).ok();
+    let mut out: Vec<(PathBuf, bool, std::time::Duration)> = vec![];
     for prefix in prefixes {
-        let c = prefix.join("lib").join("julia").join(&so);
-        if out.contains(&c) || !c.exists() {
+        let Some(c) = crate::discover::sysimage_of(&prefix) else { continue };
+        if out.iter().any(|o| o.0 == c) {
             continue;
         }
         // Cheap pre-filter on the version string in the embedded header.
@@ -1060,14 +1050,34 @@ fn sysimage_candidates(img: &Image) -> Vec<PathBuf> {
             let emb = &m[off..off + len.min(4096)];
             let ok = match crate::header::parse_base(emb) {
                 Ok((h, _)) => &h.julia_version == want,
-                Err(_) => !emb.starts_with(crate::header::JI_MAGIC),
+                // Only 1.13 (format 12) system images are headerless among those we support.
+                Err(_) => !emb.starts_with(crate::header::JI_MAGIC) && img.header.base.format_version == 12,
             };
-            if ok {
-                out.push(c);
+            if !ok {
+                continue;
             }
+            // Prefer system images written shortly before the cache file.
+            let st = std::fs::metadata(&c).and_then(|m| m.modified()).ok();
+            let (older, gap) = match (st, ji_time) {
+                (Some(s), Some(j)) => match j.duration_since(s) {
+                    Ok(d) => (true, d),
+                    Err(e) => (false, e.duration()),
+                },
+                _ => (false, std::time::Duration::MAX),
+            };
+            out.push((c, older, gap));
         }
     }
-    out
+    out.sort_by_key(|o| (!o.1, o.2));
+    let mut v: Vec<PathBuf> = vec![];
+    // An explicit hint is tried first but still has to match the Core build id.
+    if let Ok(p) = std::env::var("JULIA_SYSIMAGE")
+        && !p.is_empty()
+    {
+        v.push(PathBuf::from(p));
+    }
+    v.extend(out.into_iter().map(|o| o.0));
+    v
 }
 
 #[cfg(target_arch = "wasm32")]

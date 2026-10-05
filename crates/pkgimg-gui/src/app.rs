@@ -103,6 +103,9 @@ pub struct App {
     hist_pos: usize,
     referrers: Option<(Obj, Vec<(usize, String)>)>,
     show_hex: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    browser: crate::browser::Browser,
+    show_browser: bool,
 }
 
 impl App {
@@ -133,14 +136,53 @@ impl App {
             hist_pos: 0,
             referrers: None,
             show_hex: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            browser: crate::browser::Browser::new(),
+            show_browser: false,
         };
         if let Some(l) = initial {
             app.start_load(&cc.egui_ctx, l);
         }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(urls) = web::load_param() {
+            app.start_fetch(&cc.egui_ctx, urls);
+        }
         app
     }
 
+    /// Web: fetch `urls` and load them as dropped files.
+    #[cfg(target_arch = "wasm32")]
+    fn start_fetch(&mut self, ctx: &egui::Context, urls: Vec<String>) {
+        let (tx, rx) = mpsc::channel();
+        let ctx2 = ctx.clone();
+        let label = urls.join(", ");
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut files = vec![];
+            for u in urls {
+                match web::fetch_bytes(&u).await {
+                    Ok(b) => files.push((u.rsplit('/').next().unwrap_or(&u).to_string(), b)),
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("{u}: {e}")));
+                        ctx2.request_repaint();
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(crate::load(Load::Bytes(files)).map_err(|e| format!("{e:#}")));
+            ctx2.request_repaint();
+        });
+        self.state = State::Loading(rx, label);
+    }
+
     fn start_load(&mut self, ctx: &egui::Context, load: Load) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Load::Paths(p, _) = &load
+            && let Some(first) = p.first()
+        {
+            let abs = std::fs::canonicalize(first).unwrap_or_else(|_| first.clone());
+            self.browser.remember(&abs);
+        }
+        self.show_browser = false;
         let (tx, rx) = mpsc::channel();
         let label = match &load {
             Load::Paths(p, _) => p.first().map(|p| p.display().to_string()).unwrap_or_default(),
@@ -173,6 +215,11 @@ impl App {
         self.history.push(o);
         self.hist_pos = self.history.len();
         self.referrers = None;
+    }
+
+    #[cfg(test)]
+    pub fn browser_mut(&mut self) -> &mut crate::browser::Browser {
+        &mut self.browser
     }
 
     #[cfg(test)]
@@ -303,6 +350,12 @@ impl eframe::App for App {
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("pkgimg");
+                #[cfg(not(target_arch = "wasm32"))]
+                if matches!(self.state, State::Ready(_))
+                    && ui.selectable_label(self.show_browser, "📂 Open…").on_hover_text("browse cache files (ctrl+o)").clicked()
+                {
+                    self.show_browser = !self.show_browser;
+                }
                 ui.separator();
                 if let State::Ready(m) = &self.state {
                     let im = m.w.target();
@@ -350,6 +403,23 @@ impl eframe::App for App {
             }
         });
 
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
+            self.show_browser = !self.show_browser;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.show_browser || matches!(self.state, State::Empty | State::Failed(_)) {
+            let mut pick = None;
+            egui::CentralPanel::default().show(ui, |ui| {
+                if let State::Failed(e) = &self.state {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                }
+                pick = self.browser.ui(ui);
+            });
+            if let Some(p) = pick {
+                self.start_load(&ctx, Load::Paths(vec![p.ji], p.sysimage));
+            }
+            return;
+        }
         let state = std::mem::replace(&mut self.state, State::Empty);
         let state = match state {
             State::Ready(mut m) => {
@@ -400,6 +470,8 @@ impl App {
             ui.label("Drop a .ji (with its .so next to it) here, or enter a path.");
             #[cfg(target_arch = "wasm32")]
             ui.label("In the browser, drop the .ji and .so together, plus sys.so and dependency .ji files to resolve names.");
+            #[cfg(target_arch = "wasm32")]
+            ui.label(RichText::new("Or open this page with ?load=url1,url2,… to fetch them.").weak());
             #[cfg(not(target_arch = "wasm32"))]
             ui.horizontal(|ui| {
                 let r = ui.add(egui::TextEdit::singleline(&mut self.path_input).hint_text("~/.julia/compiled/v1.14/Pkg/xxxx.ji").desired_width(480.0));
@@ -1169,7 +1241,7 @@ impl App {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn shellexpand(s: &str) -> std::path::PathBuf {
+pub fn shellexpand(s: &str) -> std::path::PathBuf {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix("~/")
         && let Some(h) = std::env::var_os("HOME")
@@ -1193,4 +1265,31 @@ fn link_trunc(ui: &mut Ui, text: &str) -> egui::Response {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     r
+}
+
+#[cfg(target_arch = "wasm32")]
+mod web {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    /// URLs from `?load=a,b,c`.
+    pub fn load_param() -> Option<Vec<String>> {
+        let search = web_sys::window()?.location().search().ok()?;
+        let q = search.strip_prefix('?')?;
+        let v = q.split('&').find_map(|kv| kv.strip_prefix("load="))?;
+        let v = js_sys::decode_uri_component(v).ok().map(String::from).unwrap_or_else(|| v.to_string());
+        let urls: Vec<String> = v.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+        (!urls.is_empty()).then_some(urls)
+    }
+
+    pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+        let window = web_sys::window().ok_or("no window")?;
+        let resp = JsFuture::from(window.fetch_with_str(url)).await.map_err(|e| format!("{e:?}"))?;
+        let resp: web_sys::Response = resp.dyn_into().map_err(|_| "not a Response")?;
+        if !resp.ok() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+        let buf = JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?).await.map_err(|e| format!("{e:?}"))?;
+        Ok(js_sys::Uint8Array::new(&buf).to_vec())
+    }
 }

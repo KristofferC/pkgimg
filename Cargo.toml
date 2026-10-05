@@ -8,3 +8,10 @@ license = "MIT"
 
 [profile.release]
 debug = 1
+
+[profile.web]
+inherits = "release"
+debug = false
+strip = true
+lto = true
+codegen-units = 1

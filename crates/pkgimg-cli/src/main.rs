@@ -91,6 +91,17 @@ enum Cmd {
         #[arg(long = "const")]
         cst: bool,
     },
+    /// Cache files found on this machine (depots, Julia installs, source builds).
+    List {
+        /// Only packages whose name contains this string.
+        filter: Option<String>,
+        /// Only this Julia version directory, e.g. `1.14`.
+        #[arg(long)]
+        julia: Option<String>,
+        /// Extra directories to scan.
+        #[arg(long = "dir")]
+        dirs: Vec<PathBuf>,
+    },
     /// Required modules and where they were resolved.
     Deps { file: PathBuf },
     /// Source files embedded in the cache file.
@@ -144,13 +155,13 @@ struct Ctx {
 }
 
 impl Ctx {
-    fn rows<T: Serialize>(&self, cmd: &str, w: &World, rows: &[T], cols: &[(&str, &str)], extra: Value) {
+    fn rows<T: Serialize>(&self, cmd: &str, image: Value, rows: &[T], cols: &[(&str, &str)], extra: Value) {
         let n = if self.limit == 0 { rows.len() } else { rows.len().min(self.limit) };
         if self.json {
             let mut v = json!({
                 "schema": "pkgimg/1",
                 "command": cmd,
-                "image": image_id(w),
+                "image": image,
                 "total_rows": rows.len(),
                 "truncated": n < rows.len(),
                 "rows": &rows[..n],
@@ -252,12 +263,15 @@ fn heap_hist(w: &World, objs: &[ObjEntry], cst: &[ObjEntry], by: HeapBy, section
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let ctx = Ctx { json: cli.json, limit: cli.limit };
+    if let Cmd::List { filter, julia, dirs } = &cli.cmd {
+        return list(&ctx, filter.as_deref(), julia.as_deref(), dirs);
+    }
     if let Cmd::Diff { a, b } = &cli.cmd {
         let open = |p: &PathBuf| World::open(&resolve_target(p, &cli.depots)?, Options { sysimage: cli.sysimage.clone(), depots: cli.depots.clone(), verbose: cli.verbose });
         return diff(&ctx, &open(a)?, &open(b)?);
     }
     let file = match &cli.cmd {
-        Cmd::Diff { .. } => unreachable!(),
+        Cmd::Diff { .. } | Cmd::List { .. } => unreachable!(),
         Cmd::Summary { file } | Cmd::Heap { file, .. } | Cmd::Compiled { file, .. } | Cmd::Methods { file } | Cmd::Objects { file, .. } | Cmd::Show { file, .. } | Cmd::Why { file, .. } | Cmd::Asm { file, .. }
         | Cmd::Deps { file } | Cmd::Sources { file, .. } => file.clone(),
     };
@@ -272,7 +286,7 @@ fn main() -> Result<()> {
         Cmd::Heap { by, section, .. } => {
             let (objs, cst) = tables(&w);
             let rows = heap_hist(&w, &objs, &cst, by, section);
-            ctx.rows("heap", &w, &rows, &[("bytes", "bytes"), ("count", "count"), ("key", "type")], json!({}));
+            ctx.rows("heap", image_id(&w), &rows, &[("bytes", "bytes"), ("count", "count"), ("key", "type")], json!({}));
         }
         Cmd::Compiled { by, sort, filter, external, .. } => compiled(&ctx, &w, by, sort, filter, external, cli.provenance.as_deref()),
         Cmd::Asm { what, .. } => asm(&ctx, &w, &what)?,
@@ -281,10 +295,10 @@ fn main() -> Result<()> {
             let (objs, _) = tables(&w);
             let mut rows = analysis::methods(&w, w.target, &objs);
             rows.sort_by(|a, b| (&a.module, &a.name, &a.file, a.line).cmp(&(&b.module, &b.name, &b.file, b.line)));
-            ctx.rows("methods", &w, &rows, &[("module", "module"), ("name", "name"), ("sig", "signature"), ("file", "file"), ("line", "line")], json!({}));
+            ctx.rows("methods", image_id(&w), &rows, &[("module", "module"), ("name", "name"), ("sig", "signature"), ("file", "file"), ("line", "line")], json!({}));
         }
         Cmd::Deps { .. } => deps(&ctx, &w),
-        Cmd::Diff { .. } => unreachable!(),
+        Cmd::Diff { .. } | Cmd::List { .. } => unreachable!(),
         Cmd::Show { offset, cst, .. } => show(&ctx, &w, pkgimg_core::Obj { img: w.target, cst, off: offset }),
         Cmd::Objects { ty, .. } => {
             let (objs, cst) = tables(&w);
@@ -299,7 +313,7 @@ fn main() -> Result<()> {
                     "size": e.size, "type": t, "value": w.show(pkgimg_core::Val::Obj(e.obj), 3),
                 }));
             }
-            ctx.rows("objects", &w, &rows, &[("section", "section"), ("offset", "offset"), ("size", "size"), ("type", "type"), ("value", "value")], json!({}));
+            ctx.rows("objects", image_id(&w), &rows, &[("section", "section"), ("offset", "offset"), ("size", "size"), ("type", "type"), ("value", "value")], json!({}));
         }
         Cmd::Sources { show, .. } => {
             let src = w.target().srctext();
@@ -310,7 +324,7 @@ fn main() -> Result<()> {
                 }
             } else {
                 let rows: Vec<Value> = src.iter().map(|(p, t)| json!({"path": p, "bytes": t.len(), "lines": t.lines().count()})).collect();
-                ctx.rows("sources", &w, &rows, &[("bytes", "bytes"), ("lines", "lines"), ("path", "path")], json!({}));
+                ctx.rows("sources", image_id(&w), &rows, &[("bytes", "bytes"), ("lines", "lines"), ("path", "path")], json!({}));
             }
         }
     }
@@ -466,7 +480,7 @@ fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>
             CiSort::InferTime => b.infer_self_ms.total_cmp(&a.infer_self_ms),
             CiSort::Name => a.key.cmp(&b.key),
         }.then(b.code_instances.cmp(&a.code_instances)));
-        ctx.rows("compiled", w, &g, &[("code_instances", "CIs"), ("native_bytes", "native"), ("inferred_bytes", "inferred"), ("infer_self_ms", "infer ms"), ("key", "group")], extra);
+        ctx.rows("compiled", image_id(w), &g, &[("code_instances", "CIs"), ("native_bytes", "native"), ("inferred_bytes", "inferred"), ("infer_self_ms", "infer ms"), ("key", "group")], extra);
         return;
     }
     rows.sort_by(|a, b| match sort {
@@ -482,7 +496,7 @@ fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>
         func: String,
     }
     let shown: Vec<Shown> = rows.iter().map(|r| Shown { r, func: format!("{}.{}{}", r.module, r.method, r.spec) }).collect();
-    ctx.rows("compiled", w, &shown, &[("native_bytes", "native"), ("inferred_bytes", "inferred"), ("infer_self_ms", "infer ms"), ("status", "status"), ("invoke", "invoke"), ("func", "specialization")], extra);
+    ctx.rows("compiled", image_id(w), &shown, &[("native_bytes", "native"), ("inferred_bytes", "inferred"), ("infer_self_ms", "infer ms"), ("status", "status"), ("invoke", "invoke"), ("func", "specialization")], extra);
 }
 
 fn deps(ctx: &Ctx, w: &World) {
@@ -506,7 +520,7 @@ fn deps(ctx: &Ctx, w: &World) {
             json!({"name": m.name, "uuid": m.uuid, "build_id": format!("{:016x}{:016x}", m.build_id_hi, m.build_id_lo), "location": loc})
         })
         .collect();
-    ctx.rows("deps", w, &rows, &[("name", "module"), ("location", "location")], json!({}));
+    ctx.rows("deps", image_id(w), &rows, &[("name", "module"), ("location", "location")], json!({}));
 }
 
 /// Drop gensym counters (`#foo#123` -> `#foo#`) so keys are stable across builds.
@@ -769,42 +783,62 @@ fn why(ctx: &Ctx, w: &World, what: &str, prov: Option<&std::path::Path>) -> Resu
     Ok(())
 }
 
-/// Accept a package name in place of a path: the most recently written cache for it in
-/// `$JULIA_DEPOT_PATH` / `~/.julia` (any Julia version).
+/// Accept a package name in place of a path: the most recently written cache for it that
+/// this reader supports, among all discovered depots and Julia installations.
 fn resolve_target(p: &PathBuf, depots: &[PathBuf]) -> Result<PathBuf> {
+    use pkgimg_core::discover;
     if p.exists() || p.components().count() > 1 {
         return Ok(p.clone());
     }
     let name = p.to_string_lossy();
-    let mut ds: Vec<PathBuf> = depots.to_vec();
-    if let Ok(dp) = std::env::var("JULIA_DEPOT_PATH") {
-        ds.extend(dp.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
-    }
-    if let Some(h) = std::env::var_os("HOME") {
-        ds.push(std::path::Path::new(&h).join(".julia"));
-    }
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for d in ds {
-        let Ok(vers) = std::fs::read_dir(d.join("compiled")) else { continue };
-        for v in vers.flatten() {
-            let Ok(files) = std::fs::read_dir(v.path().join(&*name)) else { continue };
-            for f in files.flatten() {
-                let fp = f.path();
-                if fp.extension().is_some_and(|e| e == "ji")
-                    && let Ok(t) = f.metadata().and_then(|m| m.modified())
-                    && best.as_ref().is_none_or(|b| t > b.0)
-                {
-                    best = Some((t, fp));
-                }
-            }
+    let d = discover::discover(depots);
+    let mut cands: Vec<&discover::CacheFile> = d.caches.iter().filter(|c| c.package == name).collect();
+    cands.sort_by(|a, b| b.modified.cmp(&a.modified));
+    match cands.into_iter().find(|c| discover::read_summary(&c.ji).is_some_and(|s| s.supported)) {
+        Some(c) => {
+            eprintln!("using {}", c.ji.display());
+            Ok(c.ji.clone())
         }
+        None => anyhow::bail!("{name}: no such file, and no supported cache file for a package of that name (see `pkgimg list {name}`)"),
     }
-    match best {
-        Some((_, f)) => {
-            eprintln!("using {}", f.display());
-            Ok(f)
-        }
-        None => anyhow::bail!("{name}: no such file, and no cache file for a package of that name in the depots"),
+}
+
+fn list(ctx: &Ctx, filter: Option<&str>, julia: Option<&str>, dirs: &[PathBuf]) -> Result<()> {
+    use pkgimg_core::discover;
+    let d = discover::discover(dirs);
+    let f = filter.map(|f| f.to_lowercase());
+    let jv = julia.map(|j| if j.starts_with('v') { j.to_string() } else { format!("v{j}") });
+    let mut rows: Vec<&discover::CacheFile> = d
+        .caches
+        .iter()
+        .filter(|c| f.as_ref().is_none_or(|f| c.package.to_lowercase().contains(f)))
+        .filter(|c| jv.as_ref().is_none_or(|j| &c.julia == j))
+        .collect();
+    rows.sort_by(|a, b| b.modified.cmp(&a.modified));
+    let now = std::time::SystemTime::now();
+    let vals: Vec<Value> = rows
+        .iter()
+        .map(|c| {
+            let age = now.duration_since(c.modified).map(|d| d.as_secs()).unwrap_or(0);
+            let r = &d.roots[c.root];
+            json!({
+                "package": c.package, "julia": c.julia, "path": c.ji, "ji_bytes": c.ji_size,
+                "native_bytes": c.native_size, "age": human_age(age), "age_seconds": age,
+                "location": format!("{:?} {}", r.kind, r.path.display()).to_lowercase().replacen(' ', ": ", 1),
+                "sysimage": discover::sysimage_for(&d, c),
+            })
+        })
+        .collect();
+    ctx.rows("list", Value::Null, &vals, &[("package", "package"), ("julia", "julia"), ("age", "modified"), ("ji_bytes", ".ji"), ("native_bytes", "native"), ("path", "path")], json!({"roots": d.roots}));
+    Ok(())
+}
+
+fn human_age(s: u64) -> String {
+    match s {
+        s if s < 120 => format!("{s}s ago"),
+        s if s < 7200 => format!("{}m ago", s / 60),
+        s if s < 172800 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86400),
     }
 }
 

@@ -1,4 +1,6 @@
 mod app;
+#[cfg(not(target_arch = "wasm32"))]
+mod browser;
 mod model;
 
 use anyhow::Result;
@@ -130,5 +132,28 @@ mod shots {
         h.get_by_label("Code instances").click();
         h.state_mut().select_largest_ci();
         save(&mut h, "inspector");
+    }
+
+    /// Render the file browser into `$PKGIMG_SHOT_DIR/browser.png` (run with --ignored).
+    #[test]
+    #[ignore]
+    fn browser_screenshot() {
+        let dir = std::path::PathBuf::from(std::env::var("PKGIMG_SHOT_DIR").expect("PKGIMG_SHOT_DIR"));
+        let mut h = egui_kittest::Harness::builder()
+            .with_size([1500.0, 900.0])
+            .wgpu()
+            .build_eframe(|cc| app::App::new(cc, None));
+        for _ in 0..600 {
+            h.step();
+            if h.state_mut().browser_mut().scanned() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        h.run_steps(2);
+        h.render().unwrap().save(dir.join("browser-all.png")).unwrap();
+        h.state_mut().browser_mut().set_filter("Dates");
+        h.run_steps(4);
+        h.render().unwrap().save(dir.join("browser.png")).unwrap();
     }
 }
