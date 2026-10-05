@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/pkgimg-core", "crates/pkgimg-cli"]
+members = ["crates/pkgimg-core", "crates/pkgimg-cli", "crates/pkgimg-gui"]
 
 [workspace.package]
 edition = "2024"

@@ -1,0 +1,16 @@
+[package]
+name = "pkgimg-gui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+eframe = "0.36.2"
+egui = "0.36.2"
+egui_extras = "0.36.2"
+pkgimg-core = { version = "0.1.0", path = "../pkgimg-core" }
+
+[dev-dependencies]
+egui_kittest = { version = "0.36.2", features = ["wgpu", "snapshot", "eframe"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }

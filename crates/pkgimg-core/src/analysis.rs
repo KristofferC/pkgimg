@@ -140,7 +140,7 @@ pub fn histogram(rows: impl Iterator<Item = (String, u64, u64)>) -> Vec<HistRow>
     v
 }
 
-fn f16_to_f32(h: u16) -> f32 {
+pub fn f16_to_f32(h: u16) -> f32 {
     let s = ((h >> 15) & 1) as u32;
     let e = ((h >> 10) & 0x1f) as i32;
     let m = (h & 0x3ff) as u32;
@@ -389,7 +389,7 @@ pub fn first_referrers(w: &World, img: ImgId, objs: &[ObjEntry]) -> HashMap<Obj,
     out
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Group {
     Type,
     FullType,
@@ -397,7 +397,7 @@ pub enum Group {
     Section,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SectionSel {
     All,
     Objects,

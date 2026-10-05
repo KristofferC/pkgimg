@@ -70,6 +70,11 @@ pub fn fields(w: &World, o: Obj) -> Vec<FieldView> {
         };
         let value = if f.isptr {
             FieldValue::Ptr(w.ptr(o, f.offset))
+        } else if ti.kind == Kind::CodeInstance && name.starts_with("time_") && f.size == 2 {
+            // Float16 seconds
+            let h = u16::from_le_bytes(w.bytes(o, f.offset, 2).try_into().unwrap_or([0, 0]));
+            let secs = crate::analysis::f16_to_f32(h);
+            FieldValue::Bits(if secs >= 1.0 { format!("{secs:.1} s") } else { format!("{:.3} ms", secs * 1000.0) })
         } else {
             FieldValue::Bits(fmt_bits(&tyname, w.bytes(o, f.offset, f.size)))
         };
