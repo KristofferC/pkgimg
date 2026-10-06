@@ -180,6 +180,7 @@ mod shots {
         }
         assert!(h.state().is_ready(), "image did not load");
         let save = |h: &mut egui_kittest::Harness<app::App>, name: &str| {
+            h.remove_cursor();
             h.run_steps(4);
             let img = h.render().expect("render");
             img.save(dir.join(format!("{name}.png"))).unwrap();
@@ -220,6 +221,7 @@ mod shots {
             h.run_steps(4);
         };
         let save = |h: &mut egui_kittest::Harness<app::App>, name: &str| {
+            h.remove_cursor();
             h.run_steps(4);
             h.render().expect("render").save(dir.join(format!("{name}.png"))).unwrap();
         };

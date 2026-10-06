@@ -9,6 +9,14 @@ into the system image and dependency caches to name every type, method and speci
 
 Supported formats: Julia master (image format v16) and 1.13 (v12), 64-bit.
 
+The GUI on the `Pkg` stdlib image from Julia 1.13.1:
+
+| Overview | Insights |
+|:-:|:-:|
+| ![Overview](docs/screenshots/overview.png) | ![Insights](docs/screenshots/insights.png) |
+| **Code instances and inspector** | **Heap histogram** |
+| ![Code instances and inspector](docs/screenshots/inspector.png) | ![Heap histogram](docs/screenshots/heap.png) |
+
 ## CLI
 
 ```
