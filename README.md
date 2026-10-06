@@ -87,7 +87,8 @@ cargo run --release -p pkgimg-gui -- path/to/cache.ji
 Files can also be dropped onto the window. Tabs: overview, insights, heap histogram,
 objects, code instances, methods (grouped by function or source line), embedded sources
 (with per-line method markers) and dependencies. The inspector decodes any object and
-links to its fields across images; use alt+←/→ to go back and forward. The overview
+links to its fields across images. Back and forward (⏴/⏵, alt+←/→ or the mouse side
+buttons) step through visited views and inspected objects. The overview
 cards link to heap, compiled code and methods, and the overview lists anything the
 insights flag. Copy path reuses the current image in CLI commands.
 

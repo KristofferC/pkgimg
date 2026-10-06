@@ -80,6 +80,19 @@ fn m_group_key(r: &pkgimg_core::analysis::MethodRow, g: MGroup) -> String {
     }
 }
 
+/// A place in a document's navigation history: the view and the inspected object.
+#[derive(Clone, PartialEq)]
+struct Loc {
+    tab: Tab,
+    sel: Option<Obj>,
+    obj_exact: Option<u32>,
+    ci_group: CiGroup,
+    ci_group_sel: Option<String>,
+    m_group: MGroup,
+    m_group_sel: Option<String>,
+    src_sel: usize,
+}
+
 #[derive(Default)]
 struct Sorted {
     col: usize,
@@ -131,7 +144,9 @@ struct Doc {
     /// Insight (by kind) to scroll to on the insights tab.
     insight_scroll: Option<&'static str>,
     // inspector
-    history: Vec<Obj>,
+    sel: Option<Obj>,
+    /// Visited locations; `history[hist_pos]` is the current one.
+    history: Vec<Loc>,
     hist_pos: usize,
     referrers: Option<(Obj, Vec<(usize, String)>)>,
     show_hex: bool,
@@ -352,6 +367,7 @@ impl Doc {
             src_sel: 0,
             src_scroll_line: None,
             insight_scroll: None,
+            sel: None,
             history: vec![],
             hist_pos: 0,
             referrers: None,
@@ -410,17 +426,61 @@ impl Doc {
     }
 
     fn select(&mut self, o: Obj) {
-        if self.history.get(self.hist_pos.wrapping_sub(1)) == Some(&o) {
-            return;
-        }
-        self.history.truncate(self.hist_pos);
-        self.history.push(o);
-        self.hist_pos = self.history.len();
-        self.referrers = None;
+        self.sel = Some(o);
     }
 
     fn selected(&self) -> Option<Obj> {
-        self.hist_pos.checked_sub(1).and_then(|i| self.history.get(i)).copied()
+        self.sel
+    }
+
+    fn loc(&self) -> Loc {
+        Loc {
+            tab: self.tab,
+            sel: self.sel,
+            obj_exact: self.obj_exact,
+            ci_group: self.ci_group,
+            ci_group_sel: self.ci_group_sel.clone(),
+            m_group: self.m_group,
+            m_group_sel: self.m_group_sel.clone(),
+            src_sel: self.src_sel,
+        }
+    }
+
+    /// Add the current location to the history if it changed this frame.
+    fn record(&mut self) {
+        let cur = self.loc();
+        if self.history.get(self.hist_pos) == Some(&cur) {
+            return;
+        }
+        if !self.history.is_empty() {
+            self.history.truncate(self.hist_pos + 1);
+        }
+        self.history.push(cur);
+        self.hist_pos = self.history.len() - 1;
+    }
+
+    fn can_go(&self, back: bool) -> bool {
+        if back { self.hist_pos > 0 } else { self.hist_pos + 1 < self.history.len() }
+    }
+
+    /// Step back or forward in the history.
+    fn go(&mut self, back: bool) {
+        if !self.can_go(back) {
+            return;
+        }
+        if back { self.hist_pos -= 1 } else { self.hist_pos += 1 }
+        let l = self.history[self.hist_pos].clone();
+        self.tab = l.tab;
+        self.sel = l.sel;
+        self.obj_exact = l.obj_exact;
+        self.ci_group = l.ci_group;
+        self.ci_group_sel = l.ci_group_sel;
+        self.m_group = l.m_group;
+        self.m_group_sel = l.m_group_sel;
+        self.src_sel = l.src_sel;
+        for k in [&mut self.obj_rows.key, &mut self.ci_groups.key, &mut self.ci_sort.key, &mut self.m_groups.key, &mut self.m_sort.key] {
+            k.clear();
+        }
     }
 
     fn back_forward(&mut self, ctx: &egui::Context) {
@@ -430,13 +490,11 @@ impl Doc {
                 i.pointer.button_pressed(egui::PointerButton::Extra2) || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight)),
             )
         });
-        if back && self.hist_pos > 1 {
-            self.hist_pos -= 1;
-            self.referrers = None;
+        if back {
+            self.go(true);
         }
-        if fwd && self.hist_pos < self.history.len() {
-            self.hist_pos += 1;
-            self.referrers = None;
+        if fwd {
+            self.go(false);
         }
     }
 
@@ -472,7 +530,15 @@ impl Doc {
             });
         }
         let flagged = m.insights.iter().filter(|i| i.severity > Severity::Info).count();
+        let mut go = None;
         ui.horizontal(|ui| {
+            if ui.add_enabled(self.can_go(true), egui::Button::new("⏴")).on_hover_text("back (alt+←)").clicked() {
+                go = Some(true);
+            }
+            if ui.add_enabled(self.can_go(false), egui::Button::new("⏵")).on_hover_text("forward (alt+→)").clicked() {
+                go = Some(false);
+            }
+            ui.separator();
             for (t, name) in TABS {
                 let text = if t == Tab::Insights && flagged > 0 { format!("{name} ({flagged})") } else { name.to_string() };
                 if ui.selectable_label(self.tab == t, text).clicked() {
@@ -480,6 +546,9 @@ impl Doc {
                 }
             }
         });
+        if let Some(back) = go {
+            self.go(back);
+        }
     }
 
     fn ui(&mut self, ui: &mut Ui) {
@@ -527,6 +596,7 @@ impl Doc {
             Tab::Deps => self.deps(ui, &m),
         });
         self.state = State::Ready(m);
+        self.record();
     }
 }
 
@@ -1589,25 +1659,17 @@ impl Doc {
     fn inspector(&mut self, ui: &mut Ui, m: &Model) {
         let Some(o) = self.selected() else { return };
         let mut nav = None;
+        let mut close = false;
         ui.horizontal(|ui| {
-            if ui.add_enabled(self.hist_pos > 1, egui::Button::new("⏴")).on_hover_text("back (alt+←)").clicked() {
-                self.hist_pos -= 1;
-                self.referrers = None;
-            }
-            if ui.add_enabled(self.hist_pos < self.history.len(), egui::Button::new("⏵")).on_hover_text("forward (alt+→)").clicked() {
-                self.hist_pos += 1;
-                self.referrers = None;
-            }
             ui.strong("Inspector");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("×").clicked() {
-                    self.history.clear();
-                    self.hist_pos = 0;
-                }
+                close = ui.button("×").clicked();
             });
         });
-        let Some(o2) = self.selected() else { return };
-        let o = if o2 != o { o2 } else { o };
+        if close {
+            self.sel = None;
+            return;
+        }
         ui.separator();
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.set_max_width(ui.available_width());
@@ -1868,6 +1930,34 @@ mod tests {
         app.close(0);
         assert!(app.doc().is_none());
         app.close(0);
+    }
+
+    #[test]
+    fn back_and_forward_restore_views() {
+        let mut d = Doc::new(State::Failed(String::new()), "a".into(), None);
+        let o = Obj { img: 0, off: 8, cst: false };
+        d.record();
+        d.tab = Tab::Heap;
+        d.record();
+        d.record();
+        d.tab = Tab::Objects;
+        d.obj_exact = Some(3);
+        d.select(o);
+        d.record();
+        d.go(true);
+        assert!(d.tab == Tab::Heap && d.obj_exact.is_none() && d.selected().is_none());
+        d.go(false);
+        assert!(d.tab == Tab::Objects && d.obj_exact == Some(3) && d.selected() == Some(o));
+        d.go(false);
+        assert!(d.tab == Tab::Objects);
+        // Navigating after going back drops the forward entries.
+        d.go(true);
+        d.go(true);
+        d.tab = Tab::Methods;
+        d.record();
+        assert!(!d.can_go(false));
+        d.go(true);
+        assert!(d.tab == Tab::Overview && !d.can_go(true));
     }
 
     #[test]
