@@ -1,6 +1,7 @@
 //! Everything computed once per loaded image, off the UI thread.
 
 use pkgimg_core::analysis::{self, CiRow, ConstLabel, Group, HistRow, MethodRow, ObjEntry, SectionSel};
+use pkgimg_core::insights::Insight;
 use pkgimg_core::world::Kind;
 use pkgimg_core::{Obj, World};
 use std::collections::HashMap;
@@ -15,6 +16,9 @@ pub struct Model {
     pub keys: Vec<String>,
     pub cis: Vec<CiRow>,
     pub methods: Vec<MethodRow>,
+    /// Per method: code instances and their native bytes.
+    pub method_cis: Vec<(u32, u64)>,
+    pub insights: Vec<Insight>,
     pub srctext: Vec<(String, String)>,
     pub hist_cache: HashMap<(Group, SectionSel), Vec<HistRow>>,
     pub load_time: Duration,
@@ -61,6 +65,15 @@ impl Model {
         }
         let provenance_path = provenance.map(|p| p.path.display().to_string());
         let methods = analysis::methods(&w, w.target, &objs);
+        let mut method_cis = vec![(0, 0); methods.len()];
+        let ix: HashMap<Obj, usize> = methods.iter().enumerate().map(|(i, r)| (r.obj, i)).collect();
+        for c in &cis {
+            if let Some(&i) = c.def.and_then(|d| ix.get(&d)) {
+                method_cis[i].0 += 1;
+                method_cis[i].1 += c.native_bytes + c.wrapper_bytes;
+            }
+        }
+        let insights = pkgimg_core::insights::insights(&w, &objs, &cst, &methods, &cis);
         let srctext = w.target().srctext();
         let stats = Stats {
             n_methods: methods.len(),
@@ -73,7 +86,7 @@ impl Model {
             untyped: objs.iter().filter(|e| e.ty.is_none()).count(),
         };
         let mut m = Model {
-            w, objs, cst, obj_key, keys, cis, methods, srctext,
+            w, objs, cst, obj_key, keys, cis, methods, method_cis, insights, srctext,
             hist_cache: HashMap::new(), load_time, stats, provenance_path,
         };
         m.hist(Group::Type, SectionSel::All);

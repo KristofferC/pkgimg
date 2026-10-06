@@ -17,6 +17,8 @@ pkgimg heap      <file.ji> [--by type|full-type|referrer|section] [--section all
 pkgimg compiled  <file.ji> [--by method|file|module|root|parent] [--sort native|inferred|infer-time|name]
                            [--filter STR] [--external]
 pkgimg methods   <file.ji>
+pkgimg insights  <file.ji>                   unusual parts: functions with very many methods, @eval
+                                             loops, piracy, many specializations, invalidated code
 pkgimg objects   <file.ji> [--type STR]
 pkgimg show      <file.ji> <offset> [--const]  decode one object: fields, elements, referrers
 pkgimg why       <file.ji> <offset|substring>  inference chain of a code instance (needs provenance)
@@ -46,6 +48,11 @@ includes the resolved system-image path and `missing_dependencies`. Warnings go 
 stderr. Ungrouped `compiled` and `methods` rows include `offset` and `const`, which can
 be passed to `show` (`--const` when true) or used to select a code instance with `why`.
 `sources --show FILE --json` returns source text and its path in a JSON object.
+`methods` rows also give the extended function (`func`), whether another module owns it
+(`func_external`), possible piracy (`pirate`) and whether it is a keyword method
+(`kwcall`, attributed to the function it wraps). `insights --json` returns `insights`,
+most severe first, each with a `severity` (`high`, `notable`, `info`), a summary, and
+`items` whose `link` names a function, source line, method or object.
 
 A typical loop to reduce compiled code:
 
@@ -69,13 +76,17 @@ the same environment variable.
 cargo run --release -p pkgimg-gui -- path/to/cache.ji
 ```
 
-Files can also be dropped onto the window. Tabs: overview, heap histogram, objects, code
-instances, methods, embedded sources (with per-line method markers) and dependencies. The
-inspector decodes any object and links to its fields across images; use alt+←/→ to go
-back and forward. The overview cards link to heap, compiled code and methods. Use
-Ctrl+O to return to the cache browser, Enter to open its first matching result, and
-Copy path to reuse the current image in CLI commands. Opening another image resets
-its filters and selections.
+Files can also be dropped onto the window. Tabs: overview, insights, heap histogram,
+objects, code instances, methods (grouped by function or source line), embedded sources
+(with per-line method markers) and dependencies. The inspector decodes any object and
+links to its fields across images; use alt+←/→ to go back and forward. The overview
+cards link to heap, compiled code and methods, and the overview lists anything the
+insights flag. Copy path reuses the current image in CLI commands.
+
+Each image opens in its own tab above the views; opening a file that is already open
+switches to it. Click a dependency (or "Open" in the inspector) to open that image in a
+new tab. Ctrl+O shows the cache browser (Enter opens its first match), Ctrl+W closes a
+tab and Ctrl+Tab / Ctrl+PageDown switch tabs.
 
 To build the browser version (requires the `wasm32-unknown-unknown` target and a
 `wasm-bindgen` CLI matching the locked dependency):

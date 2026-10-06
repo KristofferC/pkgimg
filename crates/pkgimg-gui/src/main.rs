@@ -194,6 +194,51 @@ mod shots {
         save(&mut h, "inspector");
     }
 
+    /// Insights, following an insight link, and opening a dependency in a second tab
+    /// (run with --ignored; `$PKGIMG_SHOT_FUNC` is a function listed in the insights and
+    /// `$PKGIMG_SHOT_DEP` a dependency of the image).
+    #[test]
+    #[ignore]
+    fn insights_and_tabs() {
+        let file = std::env::var("PKGIMG_SHOT_FILE").expect("PKGIMG_SHOT_FILE");
+        let dir = std::path::PathBuf::from(std::env::var("PKGIMG_SHOT_DIR").expect("PKGIMG_SHOT_DIR"));
+        let dep = std::env::var("PKGIMG_SHOT_DEP").expect("PKGIMG_SHOT_DEP");
+        let func = std::env::var("PKGIMG_SHOT_FUNC").expect("PKGIMG_SHOT_FUNC");
+        let mut h = egui_kittest::Harness::builder()
+            .with_size([1500.0, 900.0])
+            .wgpu()
+            .build_eframe(|cc| app::App::new(cc, Some(app::Load::Paths(vec![file.clone().into()], None))));
+        let wait = |h: &mut egui_kittest::Harness<app::App>| {
+            for _ in 0..1200 {
+                h.step();
+                if h.state().is_ready() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(h.state().is_ready(), "image did not load");
+            h.run_steps(4);
+        };
+        let save = |h: &mut egui_kittest::Harness<app::App>, name: &str| {
+            h.run_steps(4);
+            h.render().expect("render").save(dir.join(format!("{name}.png"))).unwrap();
+        };
+        wait(&mut h);
+        save(&mut h, "overview");
+        h.get_by_label_contains("Insights (").click();
+        save(&mut h, "insights");
+        h.get_by_label(&func).click();
+        save(&mut h, "methods-of-function");
+        h.get_by_label("function").click();
+        save(&mut h, "methods-by-function");
+        h.get_by_label("Dependencies").click();
+        save(&mut h, "deps");
+        let ctx = h.ctx.clone();
+        assert!(h.state_mut().open_dependency(&ctx, &dep), "dependency {dep} not resolved");
+        wait(&mut h);
+        save(&mut h, "dependency-tab");
+    }
+
     /// Grouped tables must not reorder between frames (run with --ignored).
     #[test]
     #[ignore]

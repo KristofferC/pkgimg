@@ -10,7 +10,8 @@ fn exercise(path: &std::path::Path) -> anyhow::Result<usize> {
     let objs = analysis::object_table(&w, w.target);
     let cst = analysis::const_table(&w, w.target, &objs);
     let cis = analysis::code_instances(&w, w.target, &objs);
-    let _ = analysis::methods(&w, w.target, &objs);
+    let methods = analysis::methods(&w, w.target, &objs);
+    let _ = pkgimg_core::insights::insights(&w, &objs, &cst, &methods, &cis);
     for g in [analysis::Group::Type, analysis::Group::FullType, analysis::Group::Referrer] {
         let _ = analysis::heap_histogram(&w, &objs, &cst, g, analysis::SectionSel::All);
     }

@@ -59,6 +59,8 @@ enum Cmd {
     },
     /// Methods defined in the image.
     Methods { file: PathBuf },
+    /// Unusual, likely costly, parts of the image (many methods per function, piracy, ...).
+    Insights { file: PathBuf },
     /// Disassemble the native code of a code instance (x86-64).
     Asm {
         file: PathBuf,
@@ -281,7 +283,7 @@ fn main() -> Result<()> {
     }
     let file = match &cli.cmd {
         Cmd::Diff { .. } | Cmd::List { .. } => unreachable!(),
-        Cmd::Summary { file } | Cmd::Heap { file, .. } | Cmd::Compiled { file, .. } | Cmd::Methods { file } | Cmd::Objects { file, .. } | Cmd::Show { file, .. } | Cmd::Why { file, .. } | Cmd::Asm { file, .. }
+        Cmd::Summary { file } | Cmd::Heap { file, .. } | Cmd::Compiled { file, .. } | Cmd::Methods { file } | Cmd::Insights { file } | Cmd::Objects { file, .. } | Cmd::Show { file, .. } | Cmd::Why { file, .. } | Cmd::Asm { file, .. }
         | Cmd::Deps { file } | Cmd::Sources { file, .. } => file.clone(),
     };
     let file = resolve_target(&file, &cli.depots)?;
@@ -307,6 +309,7 @@ fn main() -> Result<()> {
             let rows: Vec<Value> = rows.iter().map(|r| located_row(r, r.obj)).collect();
             ctx.rows("methods", image_id(&w), &rows, &[("module", "module"), ("name", "name"), ("sig", "signature"), ("file", "file"), ("line", "line")], json!({}));
         }
+        Cmd::Insights { .. } => insights(&ctx, &w, cli.provenance.as_deref()),
         Cmd::Deps { .. } => deps(&ctx, &w),
         Cmd::Diff { .. } | Cmd::List { .. } => unreachable!(),
         Cmd::Show { offset, cst, .. } => show(&ctx, &w, pkgimg_core::Obj { img: w.target, cst, off: offset }),
@@ -513,6 +516,36 @@ fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>
         value
     }).collect();
     ctx.rows("compiled", image_id(w), &shown, &[("native_bytes", "native"), ("inferred_bytes", "inferred"), ("infer_self_ms", "infer ms"), ("status", "status"), ("invoke", "invoke"), ("func", "specialization")], extra);
+}
+
+fn insights(ctx: &Ctx, w: &World, prov: Option<&std::path::Path>) {
+    let (objs, cst) = tables(w);
+    let cis = load_cis(w, &objs, prov, false);
+    let methods = analysis::methods(w, w.target, &objs);
+    let mut v = pkgimg_core::insights::insights(w, &objs, &cst, &methods, &cis);
+    let n = ctx.row_count(v.len());
+    let truncated = n < v.len();
+    v.truncate(n);
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&json!({
+            "schema": "pkgimg/1", "command": "insights", "image": image_id(w), "truncated": truncated, "insights": v,
+        })).unwrap());
+        return;
+    }
+    if v.is_empty() {
+        println!("nothing unusual found");
+    }
+    for i in &v {
+        println!("[{:?}] {}\n  {}", i.severity, i.title, i.summary);
+        let rows: Vec<Value> = i.items.iter().take(ctx.row_count(i.items.len()).min(8)).map(|it| json!({"label": it.label, "value": it.value})).collect();
+        for r in rows {
+            println!("    {:<60}  {}", cell(&r["label"]), cell(&r["value"]));
+        }
+        if i.total_items > 8 {
+            println!("    … {} more", i.total_items - 8);
+        }
+        println!();
+    }
 }
 
 fn deps(ctx: &Ctx, w: &World) {

@@ -167,6 +167,15 @@ pub struct MethodRow {
     pub sig: String,
     /// The method is defined in another image (this image adds specializations to it).
     pub external: bool,
+    /// The function the method extends: `Base.Broadcast.materialize`, a constructor `Pkg.T`,
+    /// or a callable `(::Pkg.T)`.
+    pub func: String,
+    /// The function is owned by a module outside the target package.
+    pub func_external: bool,
+    /// The function is external and no argument type belongs to the target package.
+    pub pirate: bool,
+    /// Keyword-argument method (`Core.kwcall`); `func` is the function it wraps.
+    pub kwcall: bool,
 }
 
 pub fn method_info(w: &World, m: Obj) -> MethodRow {
@@ -175,7 +184,111 @@ pub fn method_info(w: &World, m: Obj) -> MethodRow {
     let file = w.field(m, "file").and_then(|v| w.sym_name(v)).unwrap_or_default();
     let line = w.field_u64(m, "line").map_or(0, |l| l as i32 as i64);
     let sig = w.field(m, "sig").map(|s| show_sig(w, s)).unwrap_or_default();
-    MethodRow { obj: m, name, module, file, line, sig, external: false }
+    MethodRow { obj: m, name, module, file, line, sig, external: false, func: String::new(), func_external: false, pirate: false, kwcall: false }
+}
+
+/// `method_info` plus the function and ownership fields; `own` is from `own_modules`.
+pub fn method_info_full(w: &World, m: Obj, own: &[String]) -> MethodRow {
+    let sigv = w.field(m, "sig").unwrap_or(Val::Null);
+    let params = sig_params(w, sigv);
+    // Keyword methods `kwcall(::NamedTuple, ::typeof(f), args...)` belong to `f`.
+    let mut fi = 0;
+    let mut func = params.first().map_or("?".into(), |f| function_name(w, *f));
+    let kwcall = func == "Core.kwcall" && params.len() >= 3;
+    if kwcall {
+        fi = 2;
+        func = function_name(w, params[2]);
+    }
+    // The function type itself counts: constructors of `Other{Own}` and callable own types.
+    let mentions = |v: &Val| mentions_module(w, *v, own, 12);
+    let func_external = !own.is_empty() && func != "?" && params.get(fi).is_some_and(|f| !mentions(f));
+    let pirate = func_external && !params.iter().skip(fi + 1).any(mentions);
+    MethodRow { func, func_external, pirate, kwcall, ..method_info(w, m) }
+}
+
+/// Top-level module names of the target package (empty for a system image), plus the
+/// `XCore`/`XBase` packages that commonly hold the types of package `X`.
+pub fn own_modules(w: &World) -> Vec<String> {
+    let names = w.target().header.pkg.as_ref().map_or(vec![], |p| p.worklist.iter().map(|m| m.name.clone()).collect::<Vec<_>>());
+    names.iter().flat_map(|n| [n.clone(), format!("{n}Core"), format!("{n}Base")]).collect()
+}
+
+fn owns(own: &[String], module: &str) -> bool {
+    let root = module.split('.').next().unwrap_or(module);
+    own.iter().any(|o| o == root)
+}
+
+fn unwrap_unionall(w: &World, mut v: Val) -> Val {
+    for _ in 0..32 {
+        match v.obj() {
+            Some(o) if w.kind(o) == Kind::UnionAll => v = w.field(o, "body").unwrap_or(Val::Null),
+            _ => break,
+        }
+    }
+    v
+}
+
+/// Parameters of a signature tuple type (function type first).
+fn sig_params(w: &World, sig: Val) -> Vec<Val> {
+    unwrap_unionall(w, sig).obj().filter(|o| w.kind(*o) == Kind::DataType).and_then(|o| w.datatype(o)).map_or(vec![], |t| t.params.clone())
+}
+
+/// `X` of `Type{X}`: a `Type` DataType, or `Core.TypeEq` on Julia master.
+fn type_param(w: &World, o: Obj) -> Option<Val> {
+    let ti = w.type_info(o)?;
+    if ti.kind == Kind::DataType {
+        let dt = w.datatype(o)?;
+        return (dt.name == "Type" && dt.module == "Core").then(|| dt.params.first().copied()).flatten();
+    }
+    (ti.module == "Core" && ti.name == "TypeEq").then(|| w.ptr(o, 0))
+}
+
+/// Name of the function a signature's function type `f` stands for: `Mod.f`, a constructed
+/// type `Mod.T`, or a callable `(::Mod.T)`.
+fn function_name(w: &World, f: Val) -> String {
+    let f = unwrap_unionall(w, f);
+    let Some(o) = f.obj() else { return w.show(f, 3) };
+    if let Some(inner) = type_param(w, o) {
+        // Constructor: `(::Type{T})(...)`, possibly `T<:X`
+        let mut inner = unwrap_unionall(w, inner);
+        if let Some(tv) = inner.obj().filter(|o| w.kind(*o) == Kind::TypeVar) {
+            inner = w.field(tv, "ub").map(|u| unwrap_unionall(w, u)).unwrap_or(Val::Null);
+        }
+        return match inner.obj().filter(|o| w.kind(*o) == Kind::DataType).and_then(|o| w.datatype(o)) {
+            Some(t) => t.qualified(),
+            None => w.show(f, 3),
+        };
+    }
+    let Some(ti) = Some(o).filter(|o| w.kind(*o) == Kind::DataType).and_then(|o| w.datatype(o)) else {
+        return w.show(f, 3);
+    };
+    match ti.name.strip_prefix('#') {
+        Some(n) if ti.params.is_empty() && !n.contains('#') && !n.is_empty() => {
+            if ti.module.is_empty() { n.to_string() } else { format!("{}.{n}", ti.module) }
+        }
+        _ => format!("(::{})", ti.qualified()),
+    }
+}
+
+/// Whether type `v` refers to a type owned by one of `own` (searching parameters, unions,
+/// bounds and `Vararg` element types).
+fn mentions_module(w: &World, v: Val, own: &[String], depth: u32) -> bool {
+    let Some(o) = v.obj() else { return false };
+    if depth == 0 {
+        return false;
+    }
+    let rec = |f: &str| w.field(o, f).is_some_and(|x| mentions_module(w, x, own, depth - 1));
+    match w.kind(o) {
+        Kind::DataType => w.datatype(o).is_some_and(|t| owns(own, &t.module) || t.params.iter().any(|p| mentions_module(w, *p, own, depth - 1))),
+        // `where` wrappers do not count against the depth: types like `TrackedArray` nest five.
+        Kind::UnionAll => w.field(o, "body").is_some_and(|x| mentions_module(w, x, own, depth)) || rec("var"),
+        Kind::Union => rec("a") || rec("b"),
+        Kind::TypeVar => rec("ub"),
+        _ => match type_param(w, o) {
+            Some(x) => mentions_module(w, x, own, depth - 1),
+            None => w.type_info(o).is_some_and(|t| t.name == "TypeofVararg") && rec("T"),
+        },
+    }
 }
 
 /// Render a signature `Tuple{typeof(f), A, B} where T` as `(A, B) where T`.
@@ -208,6 +321,9 @@ pub struct CiRow {
     pub obj: Obj,
     #[serde(skip)]
     pub mi: Option<Obj>,
+    /// The `Method` of `mi`.
+    #[serde(skip)]
+    pub def: Option<Obj>,
     pub method: String,
     pub module: String,
     pub file: String,
@@ -271,10 +387,12 @@ pub fn code_instances(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<CiRow> {
         }
         let (mut method, mut module, mut file, mut line, mut spec, mut ext) =
             (String::new(), String::new(), String::new(), 0, String::new(), false);
+        let mut def = None;
         if let Some(mi) = mi {
             spec = w.field(mi, "specTypes").map(|s| show_sig(w, s)).unwrap_or_default();
             if let Some(m) = w.field(mi, "def").and_then(|v| v.obj()) {
                 if w.kind(m) == Kind::Method {
+                    def = Some(m);
                     let r = method_info(w, m);
                     (method, module, file, line) = (r.name, r.module, r.file, r.line);
                     ext = m.img != img;
@@ -330,7 +448,7 @@ pub fn code_instances(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<CiRow> {
         let ms = |name| w.field_u64(ci, name).map_or(0.0, |x| f16_to_f32(x as u16) * 1000.0);
         let rettype = w.field(ci, "rettype").map(|v| w.show(v, 3)).unwrap_or_default();
         out.push(CiRow {
-            obj: ci, mi, parent: None, root: None, method, module, file, line, spec, owner, status, external_method: ext,
+            obj: ci, mi, def, parent: None, root: None, method, module, file, line, spec, owner, status, external_method: ext,
             inferred_bytes, inferred, invoke, native_bytes, native_symbol, native_addr, wrapper_bytes,
             infer_self_ms: ms("time_infer_self"), infer_total_ms: ms("time_infer_total"), rettype,
         });
@@ -345,9 +463,10 @@ fn invoke_pos(w: &World, ci: Obj) -> usize {
 }
 
 pub fn methods(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<MethodRow> {
+    let own = own_modules(w);
     objs.iter()
         .filter(|e| e.ty.is_some() && w.kind(e.obj) == Kind::Method)
-        .map(|e| MethodRow { external: e.obj.img != img, ..method_info(w, e.obj) })
+        .map(|e| MethodRow { external: e.obj.img != img, ..method_info_full(w, e.obj, &own) })
         .collect()
 }
 

@@ -1,7 +1,7 @@
 //! Native file browser: discovered cache files, filters, recents.
 
-use egui::{RichText, Sense, Ui};
-use egui_extras::{Column, TableBuilder};
+use egui::{RichText, Ui};
+use egui_extras::Column;
 use pkgimg_core::discover::{self, CacheFile, Discovery, HeaderSummary, RootKind};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -293,9 +293,7 @@ impl Browser {
             }
         };
         let mut hovered = false;
-        TableBuilder::new(ui)
-            .striped(true)
-            .sense(Sense::click())
+        crate::app::clickable_table(ui)
             .column(Column::initial(220.0).clip(true).resizable(true))
             .column(Column::exact(60.0))
             .column(Column::initial(260.0).clip(true).resizable(true))

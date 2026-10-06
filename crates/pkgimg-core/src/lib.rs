@@ -7,6 +7,7 @@ pub mod discover;
 pub mod header;
 pub mod heap;
 pub mod image;
+pub mod insights;
 pub mod inspect;
 pub mod native;
 pub mod provenance;

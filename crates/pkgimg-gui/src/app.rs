@@ -2,6 +2,7 @@ use crate::model::Model;
 use egui::{Color32, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use pkgimg_core::analysis::{Group, SectionSel};
+use pkgimg_core::insights::{Link, Severity};
 use pkgimg_core::inspect::{self, FieldValue};
 use pkgimg_core::{Obj, Val};
 use std::collections::HashMap;
@@ -10,6 +11,7 @@ use std::sync::mpsc;
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Overview,
+    Insights,
     Heap,
     Objects,
     Compiled,
@@ -18,8 +20,9 @@ enum Tab {
     Deps,
 }
 
-const TABS: [(Tab, &str); 7] = [
+const TABS: [(Tab, &str); 8] = [
     (Tab::Overview, "Overview"),
+    (Tab::Insights, "Insights"),
     (Tab::Heap, "Heap"),
     (Tab::Objects, "Objects"),
     (Tab::Compiled, "Code instances"),
@@ -36,7 +39,6 @@ pub enum Load {
 }
 
 enum State {
-    Empty,
     Loading(mpsc::Receiver<Result<Model, String>>, String),
     Ready(Box<Model>),
     Failed(String),
@@ -63,6 +65,21 @@ fn ci_group_key(c: &pkgimg_core::analysis::CiRow, g: CiGroup) -> String {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MGroup {
+    None,
+    Function,
+    Location,
+}
+
+fn m_group_key(r: &pkgimg_core::analysis::MethodRow, g: MGroup) -> String {
+    match g {
+        MGroup::None => String::new(),
+        MGroup::Function => r.func.clone(),
+        MGroup::Location => format!("{}:{}", r.file, r.line),
+    }
+}
+
 #[derive(Default)]
 struct Sorted {
     col: usize,
@@ -72,10 +89,18 @@ struct Sorted {
     key: String,
 }
 
-pub struct App {
+/// One open image (a document tab): its model and all view state.
+struct Doc {
     state: State,
+    /// Display name for the document tab.
+    title: String,
+    /// Canonical path of the target image, to switch to this tab when it is opened again.
+    source: Option<std::path::PathBuf>,
+    /// Image to open in another tab (dependency links).
+    open_request: Option<Load>,
+    /// Replacement for this tab's image (reload with another system image).
+    reload: Option<Load>,
     tab: Tab,
-    path_input: String,
     sysimage_input: String,
     // heap view
     heap_group: Group,
@@ -95,15 +120,27 @@ pub struct App {
     ci_sort: Sorted,
     // methods
     m_filter: String,
+    m_group: MGroup,
+    m_group_sel: Option<String>,
+    m_groups: Sorted,
+    m_group_rows: Vec<(String, (u64, u64, u64, bool))>,
     m_sort: Sorted,
     // sources
     src_sel: usize,
     src_scroll_line: Option<usize>,
+    /// Insight (by kind) to scroll to on the insights tab.
+    insight_scroll: Option<&'static str>,
     // inspector
     history: Vec<Obj>,
     hist_pos: usize,
     referrers: Option<(Obj, Vec<(usize, String)>)>,
     show_hex: bool,
+}
+
+pub struct App {
+    docs: Vec<Doc>,
+    active: usize,
+    path_input: String,
     #[cfg(not(target_arch = "wasm32"))]
     browser: crate::browser::Browser,
     show_browser: bool,
@@ -113,37 +150,15 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<Load>) -> App {
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = true);
         let mut app = App {
-            state: State::Empty,
-            tab: Tab::Overview,
+            docs: vec![],
+            active: 0,
             path_input: String::new(),
-            sysimage_input: String::new(),
-            heap_group: Group::Type,
-            heap_section: SectionSel::All,
-            heap_filter: String::new(),
-            heap_sort: Sorted { col: 2, desc: true, ..Default::default() },
-            obj_filter: String::new(),
-            obj_exact: None,
-            obj_rows: Sorted::default(),
-            ci_filter: String::new(),
-            ci_group: CiGroup::None,
-            ci_group_sel: None,
-            ci_groups: Sorted { col: 2, desc: true, ..Default::default() },
-            ci_group_rows: vec![],
-            ci_sort: Sorted { col: 0, desc: true, ..Default::default() },
-            m_filter: String::new(),
-            m_sort: Sorted::default(),
-            src_sel: 0,
-            src_scroll_line: None,
-            history: vec![],
-            hist_pos: 0,
-            referrers: None,
-            show_hex: false,
             #[cfg(not(target_arch = "wasm32"))]
             browser: crate::browser::Browser::new(),
             show_browser: false,
         };
         if let Some(l) = initial {
-            app.start_load(&cc.egui_ctx, l);
+            app.open(&cc.egui_ctx, l);
         }
         #[cfg(target_arch = "wasm32")]
         if let Some(urls) = web::load_param() {
@@ -173,23 +188,197 @@ impl App {
             let _ = tx.send(crate::load(Load::Bytes(files)).map_err(|e| format!("{e:#}")));
             ctx2.request_repaint();
         });
-        self.state = State::Loading(rx, label);
+        self.push(Doc::new(State::Loading(rx, label.clone()), label, None));
     }
 
-    fn start_load(&mut self, ctx: &egui::Context, load: Load) {
+    /// Open `load` in a new tab, or switch to the tab that already shows that file.
+    fn open(&mut self, ctx: &egui::Context, load: Load) {
+        self.show_browser = false;
+        let source = Doc::source_of(&load);
         #[cfg(not(target_arch = "wasm32"))]
-        if let Load::Paths(p, _) = &load
+        if let Some(p) = &source {
+            self.browser.remember(p);
+        }
+        let same_sysimage = matches!(&load, Load::Paths(_, None));
+        if let Some(i) = self.docs.iter().position(|d| source.is_some() && d.source == source)
+            && same_sysimage
+        {
+            self.active = i;
+            if matches!(self.docs[i].state, State::Failed(_)) {
+                self.docs[i] = Doc::start(ctx, load);
+            }
+            return;
+        }
+        self.push(Doc::start(ctx, load));
+    }
+
+    fn push(&mut self, d: Doc) {
+        self.docs.push(d);
+        self.active = self.docs.len() - 1;
+    }
+
+    fn close(&mut self, i: usize) {
+        if i >= self.docs.len() {
+            return;
+        }
+        self.docs.remove(i);
+        if self.active > i || self.active >= self.docs.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+    }
+
+    fn doc(&self) -> Option<&Doc> {
+        self.docs.get(self.active)
+    }
+
+    #[cfg(test)]
+    pub fn browser_mut(&mut self) -> &mut crate::browser::Browser {
+        &mut self.browser
+    }
+
+    #[cfg(test)]
+    pub fn is_ready(&self) -> bool {
+        self.doc().is_some_and(|d| matches!(d.state, State::Ready(_)))
+    }
+
+    /// Select the code instance with the most native code (screenshot tests).
+    #[cfg(test)]
+    pub fn select_largest_ci(&mut self) {
+        let Some(d) = self.docs.get_mut(self.active) else { return };
+        let State::Ready(m) = &d.state else { return };
+        if let Some(c) = m.cis.iter().max_by_key(|c| c.native_bytes) {
+            let o = c.obj;
+            d.select(o);
+        }
+    }
+
+    /// Open the dependency named `name` of the active image (screenshot tests).
+    #[cfg(test)]
+    pub fn open_dependency(&mut self, ctx: &egui::Context, name: &str) -> bool {
+        let Some(State::Ready(m)) = self.doc().map(|d| &d.state) else { return false };
+        let Some(im) = m.w.images.iter().find(|im| im.header.pkg.as_ref().is_some_and(|p| p.worklist.iter().any(|x| x.name == name))) else { return false };
+        let l = image_load(m, im);
+        self.open(ctx, l);
+        true
+    }
+
+    /// Document tabs: one per open image, plus a button for the file browser.
+    fn doc_tabs(&mut self, ui: &mut Ui) {
+        let mut close = None;
+        for (i, d) in self.docs.iter().enumerate() {
+            let selected = i == self.active && !self.show_browser;
+            let text = match &d.state {
+                State::Loading(..) => RichText::new(format!("{} …", d.title)).weak(),
+                State::Failed(_) => RichText::new(format!("⚠ {}", d.title)).color(ui.visuals().warn_fg_color),
+                State::Ready(_) => RichText::new(&d.title),
+            };
+            let hover = d.source.as_ref().map_or_else(|| d.title.clone(), |p| p.display().to_string());
+            let r = ui.selectable_label(selected, text).on_hover_text(format!("{hover}\nmiddle-click or ctrl+w to close"));
+            if r.clicked() {
+                self.active = i;
+                self.show_browser = false;
+            }
+            if r.middle_clicked() {
+                close = Some(i);
+            }
+            if ui.add(egui::Button::new("×").frame(false)).on_hover_text("close").clicked() {
+                close = Some(i);
+            }
+            ui.add_space(4.0);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.docs.is_empty()
+            && ui.selectable_label(self.show_browser, "➕ Open…").on_hover_text("browse cache files (ctrl+o)").clicked()
+        {
+            self.show_browser = !self.show_browser;
+        }
+        if let Some(i) = close {
+            self.close(i);
+        }
+    }
+
+    fn welcome(&mut self, ui: &mut Ui) {
+        ui.add_space(40.0);
+        ui.vertical_centered(|ui| {
+            ui.heading("Open a package image");
+            ui.label("Drop a .ji (with its .so next to it) here, or enter a path.");
+            #[cfg(target_arch = "wasm32")]
+            ui.label("In the browser, drop the .ji and .so together, plus sys.so and dependency .ji files to resolve names.");
+            #[cfg(target_arch = "wasm32")]
+            ui.label(RichText::new("Or open this page with ?load=url1,url2,… to fetch them.").weak());
+            #[cfg(not(target_arch = "wasm32"))]
+            ui.horizontal(|ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut self.path_input).hint_text("~/.julia/compiled/v1.14/Pkg/xxxx.ji").desired_width(480.0));
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.button("Open").clicked() || enter) && !self.path_input.is_empty() {
+                    let p = shellexpand(&self.path_input);
+                    let ctx = ui.ctx().clone();
+                    self.open(&ctx, Load::Paths(vec![p], None));
+                }
+            });
+        });
+    }
+}
+
+impl Doc {
+    fn new(state: State, title: String, source: Option<std::path::PathBuf>) -> Doc {
+        Doc {
+            state,
+            title,
+            source,
+            open_request: None,
+            reload: None,
+            tab: Tab::Overview,
+            sysimage_input: String::new(),
+            heap_group: Group::Type,
+            heap_section: SectionSel::All,
+            heap_filter: String::new(),
+            heap_sort: Sorted { col: 2, desc: true, ..Default::default() },
+            obj_filter: String::new(),
+            obj_exact: None,
+            obj_rows: Sorted::default(),
+            ci_filter: String::new(),
+            ci_group: CiGroup::None,
+            ci_group_sel: None,
+            ci_groups: Sorted { col: 2, desc: true, ..Default::default() },
+            ci_group_rows: vec![],
+            ci_sort: Sorted { col: 0, desc: true, ..Default::default() },
+            m_filter: String::new(),
+            m_group: MGroup::None,
+            m_group_sel: None,
+            m_groups: Sorted { col: 1, desc: true, ..Default::default() },
+            m_group_rows: vec![],
+            m_sort: Sorted::default(),
+            src_sel: 0,
+            src_scroll_line: None,
+            insight_scroll: None,
+            history: vec![],
+            hist_pos: 0,
+            referrers: None,
+            show_hex: false,
+        }
+    }
+
+    fn source_of(load: &Load) -> Option<std::path::PathBuf> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Load::Paths(p, _) = load
             && let Some(first) = p.first()
         {
-            let abs = std::fs::canonicalize(first).unwrap_or_else(|_| first.clone());
-            self.browser.remember(&abs);
+            return Some(std::fs::canonicalize(first).unwrap_or_else(|_| first.clone()));
         }
-        self.show_browser = false;
+        let _ = load;
+        None
+    }
+
+    /// Start loading `load` off the UI thread (on native).
+    fn start(ctx: &egui::Context, load: Load) -> Doc {
+        let source = Doc::source_of(&load);
         let (tx, rx) = mpsc::channel();
         let label = match &load {
             Load::Paths(p, _) => p.first().map(|p| p.display().to_string()).unwrap_or_default(),
             Load::Bytes(b) => b.first().map(|b| b.0.clone()).unwrap_or_default(),
         };
+        let title = label.rsplit('/').next().unwrap_or(&label).to_string();
         let ctx2 = ctx.clone();
         let job = move || {
             let r = crate::load(load).map_err(|e| format!("{e:#}"));
@@ -200,30 +389,24 @@ impl App {
         std::thread::spawn(job);
         #[cfg(target_arch = "wasm32")]
         job();
-        self.state = State::Loading(rx, label);
+        Doc::new(State::Loading(rx, label), title, source)
     }
 
-    /// Clear all state tied to a particular model before displaying a replacement.
-    fn reset_image_view(&mut self) {
-        self.tab = Tab::Overview;
-        self.history.clear();
-        self.hist_pos = 0;
-        self.referrers = None;
-        self.obj_exact = None;
-        self.ci_group_sel = None;
-        self.ci_group = CiGroup::None;
-        self.ci_group_rows.clear();
-        self.src_sel = 0;
-        self.src_scroll_line = None;
-        self.heap_filter.clear();
-        self.obj_filter.clear();
-        self.ci_filter.clear();
-        self.m_filter.clear();
-        self.show_browser = false;
-        for s in [&mut self.heap_sort, &mut self.obj_rows, &mut self.ci_sort, &mut self.m_sort, &mut self.ci_groups] {
-            s.key.clear();
-            s.order.clear();
-        }
+    /// Pick up a finished load.
+    fn poll(&mut self) {
+        let State::Loading(rx, _) = &self.state else { return };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("The image loader stopped unexpectedly. Try opening another image.".into()),
+        };
+        self.state = match result {
+            Ok(m) => {
+                self.title = m.w.target().display_name();
+                State::Ready(Box::new(m))
+            }
+            Err(e) => State::Failed(e),
+        };
     }
 
     fn select(&mut self, o: Obj) {
@@ -236,28 +419,114 @@ impl App {
         self.referrers = None;
     }
 
-    #[cfg(test)]
-    pub fn browser_mut(&mut self) -> &mut crate::browser::Browser {
-        &mut self.browser
+    fn selected(&self) -> Option<Obj> {
+        self.hist_pos.checked_sub(1).and_then(|i| self.history.get(i)).copied()
     }
 
-    #[cfg(test)]
-    pub fn is_ready(&self) -> bool {
-        matches!(self.state, State::Ready(_))
-    }
-
-    /// Select the code instance with the most native code (screenshot tests).
-    #[cfg(test)]
-    pub fn select_largest_ci(&mut self) {
-        let State::Ready(m) = &self.state else { return };
-        if let Some(c) = m.cis.iter().max_by_key(|c| c.native_bytes) {
-            let o = c.obj;
-            self.select(o);
+    fn back_forward(&mut self, ctx: &egui::Context) {
+        let (back, fwd) = ctx.input(|i| {
+            (
+                i.pointer.button_pressed(egui::PointerButton::Extra1) || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)),
+                i.pointer.button_pressed(egui::PointerButton::Extra2) || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight)),
+            )
+        });
+        if back && self.hist_pos > 1 {
+            self.hist_pos -= 1;
+            self.referrers = None;
+        }
+        if fwd && self.hist_pos < self.history.len() {
+            self.hist_pos += 1;
+            self.referrers = None;
         }
     }
 
-    fn selected(&self) -> Option<Obj> {
-        self.hist_pos.checked_sub(1).and_then(|i| self.history.get(i)).copied()
+    /// Image summary line, resolution warnings and view tabs (top panel).
+    fn header(&mut self, ui: &mut Ui) {
+        let State::Ready(m) = &self.state else { return };
+        ui.horizontal(|ui| {
+            let im = m.w.target();
+            ui.label(RichText::new(im.display_name()).strong());
+            ui.add(egui::Label::new(RichText::new(format!("Julia {}  ·  loaded in {:.0?}", im.header.base.julia_version, m.load_time)).weak()))
+                .on_hover_text(im.path.display().to_string());
+            if ui.small_button("Copy path").on_hover_text(im.path.display().to_string()).clicked() {
+                ui.ctx().copy_text(im.path.display().to_string());
+            }
+        });
+        if m.w.sysimg.is_none() || !m.w.missing.is_empty() {
+            ui.horizontal(|ui| {
+                let msg = if m.w.sysimg.is_none() {
+                    "No matching system image found: types and methods defined outside this package cannot be decoded.".to_string()
+                } else {
+                    format!("Dependencies not found: {}", m.w.missing.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", "))
+                };
+                ui.colored_label(ui.visuals().warn_fg_color, msg);
+                #[cfg(not(target_arch = "wasm32"))]
+                if m.w.sysimg.is_none() {
+                    ui.add(egui::TextEdit::singleline(&mut self.sysimage_input).hint_text("path to sys.so").desired_width(320.0));
+                    if ui.button("Reload").clicked() && !self.sysimage_input.is_empty() {
+                        self.reload = Some(Load::Paths(vec![m.w.target().path.clone()], Some(shellexpand(&self.sysimage_input))));
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                ui.label("Drop the matching sys.so together with the .ji/.so.");
+            });
+        }
+        let flagged = m.insights.iter().filter(|i| i.severity > Severity::Info).count();
+        ui.horizontal(|ui| {
+            for (t, name) in TABS {
+                let text = if t == Tab::Insights && flagged > 0 { format!("{name} ({flagged})") } else { name.to_string() };
+                if ui.selectable_label(self.tab == t, text).clicked() {
+                    self.tab = t;
+                }
+            }
+        });
+    }
+
+    fn ui(&mut self, ui: &mut Ui) {
+        let state = std::mem::replace(&mut self.state, State::Failed(String::new()));
+        match &state {
+            State::Ready(_) => {}
+            State::Loading(_, label) => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                        ui.heading("Reading image");
+                        ui.label(label);
+                        ui.label(RichText::new("Resolving dependencies and computing heap and code statistics…").weak());
+                    });
+                });
+            }
+            State::Failed(e) => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.heading("Could not open image");
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                    if ui.button("Copy error").clicked() {
+                        ui.ctx().copy_text(e.clone());
+                    }
+                });
+            }
+        }
+        let State::Ready(mut m) = state else {
+            self.state = state;
+            return;
+        };
+        if self.selected().is_some() {
+            egui::Panel::right("inspector").resizable(true).default_size(480.0).max_size(900.0).show(ui, |ui| {
+                self.inspector(ui, &m);
+            });
+        }
+        egui::CentralPanel::default().show(ui, |ui| match self.tab {
+            Tab::Overview => self.overview(ui, &mut m),
+            Tab::Insights => self.insights(ui, &m),
+            Tab::Heap => self.heap(ui, &mut m),
+            Tab::Objects => self.objects(ui, &m),
+            Tab::Compiled => self.compiled(ui, &m),
+            Tab::Methods => self.methods(ui, &m),
+            Tab::Sources => self.sources(ui, &m),
+            Tab::Deps => self.deps(ui, &m),
+        });
+        self.state = State::Ready(m);
     }
 }
 
@@ -271,6 +540,29 @@ const CATEGORICAL_DARK: [&str; 8] = ["#3987e5", "#d95926", "#199e70", "#c98500",
 fn categorical(ui: &Ui, i: usize) -> Color32 {
     let p = if ui.visuals().dark_mode { CATEGORICAL_DARK } else { CATEGORICAL_LIGHT };
     Color32::from_hex(p[i % 8]).unwrap()
+}
+
+fn severity_color(ui: &Ui, s: Severity) -> Color32 {
+    match s {
+        Severity::High => ui.visuals().error_fg_color,
+        Severity::Notable => ui.visuals().warn_fg_color,
+        Severity::Info => bar_color(ui),
+    }
+}
+
+/// A small colored severity tag.
+fn severity_badge(ui: &mut Ui, s: Severity) {
+    let text = match s {
+        Severity::High => "HIGH",
+        Severity::Notable => "NOTABLE",
+        Severity::Info => "INFO",
+    };
+    let color = severity_color(ui, s);
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, color))
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::symmetric(4, 0))
+        .show(ui, |ui| ui.label(RichText::new(text).small().strong().color(color)));
 }
 
 fn human(b: u64) -> String {
@@ -291,6 +583,13 @@ fn data_bar(ui: &mut Ui, frac: f32, color: Color32) {
     ui.painter().rect_filled(r, 2.0, color);
 }
 
+/// Table labels must let the row receive clicks instead of starting text selection.
+/// This changes only the table's UI; source and inspector panels remain selectable.
+pub(crate) fn clickable_table(ui: &mut Ui) -> TableBuilder<'_> {
+    ui.style_mut().interaction.selectable_labels = false;
+    TableBuilder::new(ui).striped(true).sense(Sense::click())
+}
+
 /// Sortable header cell.
 fn sort_header(ui: &mut Ui, label: &str, i: usize, s: &mut Sorted, default_desc: bool) {
     let arrow = if s.col == i { if s.desc { " ⏷" } else { " ⏶" } } else { "" };
@@ -305,16 +604,22 @@ fn sort_header(ui: &mut Ui, label: &str, i: usize, s: &mut Sorted, default_desc:
     }
 }
 
+/// Open another image of the model's world with the same system image.
+fn image_load(m: &Model, im: &pkgimg_core::Image) -> Load {
+    let sys = m.w.sysimg.map(|s| m.w.img(s).path.clone());
+    Load::Paths(vec![im.path.clone()], sys)
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        // Dropped files
+        // Dropped files open in a new tab.
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if !dropped.is_empty() {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let paths: Vec<_> = dropped.iter().map(|f| f.path().to_path_buf()).collect();
-                self.start_load(&ctx, Load::Paths(paths, None));
+                self.open(&ctx, Load::Paths(paths, None));
             }
             #[cfg(target_arch = "wasm32")]
             {
@@ -337,109 +642,61 @@ impl eframe::App for App {
                     let _ = tx.send(crate::load(Load::Bytes(files)).map_err(|e| format!("{e:#}")));
                     ctx2.request_repaint();
                 });
-                self.state = State::Loading(rx, label);
-                self.history.clear();
-                self.hist_pos = 0;
+                self.push(Doc::new(State::Loading(rx, label.clone()), label, None));
             }
         }
-        if let State::Loading(rx, _) = &self.state {
-            let result = match rx.try_recv() {
-                Ok(result) => Some(result),
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => Some(Err("The image loader stopped unexpectedly. Try opening another image.".into())),
-            };
-            if let Some(result) = result {
-                self.reset_image_view();
-                self.state = match result {
-                    Ok(m) => State::Ready(Box::new(m)),
-                    Err(e) => State::Failed(e),
-                };
-            }
+        for d in &mut self.docs {
+            d.poll();
         }
-        // Back/forward with mouse buttons or alt+arrows
-        let (back, fwd) = ctx.input(|i| {
+        let (toggle_browser, close, next, prev) = ctx.input(|i| {
+            let ctrl_tab = i.modifiers.command && i.key_pressed(egui::Key::Tab);
             (
-                i.pointer.button_pressed(egui::PointerButton::Extra1) || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)),
-                i.pointer.button_pressed(egui::PointerButton::Extra2) || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight)),
+                i.modifiers.command && i.key_pressed(egui::Key::O),
+                i.modifiers.command && i.key_pressed(egui::Key::W),
+                (ctrl_tab && !i.modifiers.shift) || (i.modifiers.command && i.key_pressed(egui::Key::PageDown)),
+                (ctrl_tab && i.modifiers.shift) || (i.modifiers.command && i.key_pressed(egui::Key::PageUp)),
             )
         });
-        if back && self.hist_pos > 1 {
-            self.hist_pos -= 1;
-            self.referrers = None;
+        if toggle_browser {
+            self.show_browser = !self.show_browser;
         }
-        if fwd && self.hist_pos < self.history.len() {
-            self.hist_pos += 1;
-            self.referrers = None;
+        if close {
+            self.close(self.active);
+        }
+        let n = self.docs.len().max(1);
+        if next {
+            self.active = (self.active + 1) % n;
+        }
+        if prev {
+            self.active = (self.active + n - 1) % n;
+        }
+        if let Some(d) = self.docs.get_mut(self.active) {
+            d.back_forward(&ctx);
         }
 
         egui::Panel::top("top").show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.heading("pkgimg");
-                #[cfg(not(target_arch = "wasm32"))]
-                if matches!(self.state, State::Ready(_))
-                    && ui.selectable_label(self.show_browser, "📂 Open…").on_hover_text("browse cache files (ctrl+o)").clicked()
-                {
-                    self.show_browser = !self.show_browser;
-                }
                 ui.separator();
-                if let State::Ready(m) = &self.state {
-                    let im = m.w.target();
-                    ui.label(RichText::new(im.display_name()).strong());
-                    ui.add(egui::Label::new(RichText::new(format!("Julia {}  ·  loaded in {:.0?}", im.header.base.julia_version, m.load_time)).weak()))
-                        .on_hover_text(im.path.display().to_string());
-                    if ui.small_button("Copy path").on_hover_text(im.path.display().to_string()).clicked() {
-                        ui.ctx().copy_text(im.path.display().to_string());
-                    }
-                }
+                self.doc_tabs(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::widgets::global_theme_preference_switch(ui);
                 });
             });
-            let mut reload = None;
-            if let State::Ready(m) = &self.state
-                && (m.w.sysimg.is_none() || !m.w.missing.is_empty())
+            if !self.show_browser
+                && let Some(d) = self.docs.get_mut(self.active)
             {
-                ui.horizontal(|ui| {
-                    let msg = if m.w.sysimg.is_none() {
-                        "No matching system image found: types and methods defined outside this package cannot be decoded.".to_string()
-                    } else {
-                        format!("Dependencies not found: {}", m.w.missing.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", "))
-                    };
-                    ui.colored_label(ui.visuals().warn_fg_color, msg);
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if m.w.sysimg.is_none() {
-                        ui.add(egui::TextEdit::singleline(&mut self.sysimage_input).hint_text("path to sys.so").desired_width(320.0));
-                        if ui.button("Reload").clicked() && !self.sysimage_input.is_empty() {
-                            reload = Some(Load::Paths(vec![m.w.target().path.clone()], Some(shellexpand(&self.sysimage_input))));
-                        }
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    ui.label("Drop the matching sys.so together with the .ji/.so.");
-                });
-            }
-            if let Some(l) = reload {
-                let ctx = ui.ctx().clone();
-                self.start_load(&ctx, l);
-            }
-            if matches!(self.state, State::Ready(_)) {
-                ui.horizontal(|ui| {
-                    for (t, name) in TABS {
-                        if ui.selectable_label(self.tab == t, name).clicked() {
-                            self.tab = t;
-                        }
-                    }
-                });
+                ui.separator();
+                d.header(ui);
             }
         });
 
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
-            self.show_browser = !self.show_browser;
-        }
+        let failed = self.doc().is_some_and(|d| matches!(d.state, State::Failed(_)));
         #[cfg(not(target_arch = "wasm32"))]
-        if self.show_browser || matches!(self.state, State::Empty | State::Failed(_)) {
+        if self.show_browser || self.docs.is_empty() || failed {
             let mut pick = None;
             egui::CentralPanel::default().show(ui, |ui| {
-                if let State::Failed(e) = &self.state {
+                if let Some(Doc { state: State::Failed(e), .. }) = self.docs.get(self.active).filter(|_| !self.show_browser) {
                     ui.heading("Could not open image");
                     ui.colored_label(ui.visuals().error_fg_color, e);
                     if ui.button("Copy error").clicked() { ui.ctx().copy_text(e.clone()); }
@@ -449,83 +706,59 @@ impl eframe::App for App {
                 pick = self.browser.ui(ui);
             });
             if let Some(p) = pick {
-                self.start_load(&ctx, Load::Paths(vec![p.ji], p.sysimage));
+                // A failed tab is replaced; otherwise the pick opens in a new tab.
+                if failed && !self.show_browser {
+                    self.close(self.active);
+                }
+                self.open(&ctx, Load::Paths(vec![p.ji], p.sysimage));
             }
             return;
         }
-        let state = std::mem::replace(&mut self.state, State::Empty);
-        let state = match state {
-            State::Ready(mut m) => {
-                if self.selected().is_some() {
-                    egui::Panel::right("inspector").resizable(true).default_size(480.0).max_size(900.0).show(ui, |ui| {
-                        self.inspector(ui, &m);
-                    });
-                }
-                egui::CentralPanel::default().show(ui, |ui| match self.tab {
-                    Tab::Overview => self.overview(ui, &mut m),
-                    Tab::Heap => self.heap(ui, &mut m),
-                    Tab::Objects => self.objects(ui, &m),
-                    Tab::Compiled => self.compiled(ui, &m),
-                    Tab::Methods => self.methods(ui, &m),
-                    Tab::Sources => self.sources(ui, &m),
-                    Tab::Deps => self.deps(ui, &m),
-                });
-                State::Ready(m)
-            }
-            s => {
-                egui::CentralPanel::default().show(ui, |ui| self.welcome(ui, &s));
-                s
-            }
+        let _ = failed;
+        let Some(d) = self.docs.get_mut(self.active) else {
+            egui::CentralPanel::default().show(ui, |ui| self.welcome(ui));
+            return;
         };
-        if matches!(self.state, State::Empty) {
-            self.state = state;
+        d.ui(ui);
+        if let Some(l) = d.reload.take() {
+            self.docs[self.active] = Doc::start(&ctx, l);
+        } else if let Some(l) = d.open_request.take() {
+            self.open(&ctx, l);
         }
     }
 }
 
-impl App {
-    fn welcome(&mut self, ui: &mut Ui, s: &State) {
-        ui.add_space(40.0);
-        ui.vertical_centered(|ui| {
-            match s {
-                State::Loading(_, label) => {
-                    ui.spinner();
-                    ui.heading("Reading image");
-                    ui.label(label);
-                    ui.label(RichText::new("Resolving dependencies and computing heap and code statistics…").weak());
-                    return;
-                }
-                State::Failed(e) => {
-                    ui.colored_label(ui.visuals().error_fg_color, e);
-                    ui.add_space(12.0);
-                }
-                _ => {}
-            }
-            ui.heading("Open a package image");
-            ui.label("Drop a .ji (with its .so next to it) here, or enter a path.");
-            #[cfg(target_arch = "wasm32")]
-            ui.label("In the browser, drop the .ji and .so together, plus sys.so and dependency .ji files to resolve names.");
-            #[cfg(target_arch = "wasm32")]
-            ui.label(RichText::new("Or open this page with ?load=url1,url2,… to fetch them.").weak());
-            #[cfg(not(target_arch = "wasm32"))]
-            ui.horizontal(|ui| {
-                let r = ui.add(egui::TextEdit::singleline(&mut self.path_input).hint_text("~/.julia/compiled/v1.14/Pkg/xxxx.ji").desired_width(480.0));
-                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (ui.button("Open").clicked() || enter) && !self.path_input.is_empty() {
-                    let p = shellexpand(&self.path_input);
-                    let ctx = ui.ctx().clone();
-                    self.start_load(&ctx, Load::Paths(vec![p], None));
-                }
-            });
-        });
-    }
-
+impl Doc {
     fn overview(&mut self, ui: &mut Ui, m: &mut Model) {
         let rows: Vec<_> = m.hist(Group::Type, SectionSel::All).iter().take(20).cloned().collect();
         let m: &Model = m;
         let im = m.w.target();
         let st = &m.stats;
         egui::ScrollArea::vertical().show(ui, |ui| {
+            let flagged: Vec<_> = m.insights.iter().filter(|i| i.severity > Severity::Info).collect();
+            if let Some(first) = flagged.first() {
+                let color = severity_color(ui, first.severity);
+                egui::Frame::group(ui.style()).stroke(egui::Stroke::new(1.5, color)).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.heading("Worth a look");
+                        if ui.link("All insights").clicked() {
+                            self.tab = Tab::Insights;
+                        }
+                    });
+                    for ins in &flagged {
+                        ui.horizontal(|ui| {
+                            severity_badge(ui, ins.severity);
+                            if ui.link(RichText::new(&ins.title).strong()).clicked() {
+                                self.tab = Tab::Insights;
+                                self.insight_scroll = Some(ins.kind);
+                            }
+                            ui.add(egui::Label::new(RichText::new(&ins.summary).weak()).truncate());
+                        });
+                    }
+                });
+                ui.add_space(12.0);
+            }
             ui.heading("At a glance");
             ui.label(RichText::new("Explore what occupies this image and where compiled code comes from.").weak());
             ui.add_space(8.0);
@@ -636,6 +869,84 @@ impl App {
         });
     }
 
+    fn insights(&mut self, ui: &mut Ui, m: &Model) {
+        if m.insights.is_empty() {
+            ui.label("Nothing unusual found: no function has very many methods, no method very many specializations, and nothing was invalidated.");
+            return;
+        }
+        let mut follow = None;
+        let scroll = self.insight_scroll.take();
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.label(RichText::new("Heuristics that flag unusual, likely costly parts of this image. Click an entry to explore it.").weak());
+            ui.add_space(6.0);
+            let color = bar_color(ui);
+            for ins in &m.insights {
+                let r = egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        severity_badge(ui, ins.severity);
+                        ui.label(RichText::new(&ins.title).strong().size(16.0));
+                    });
+                    ui.label(&ins.summary);
+                    ui.add(egui::Label::new(RichText::new(ins.detail).weak()).wrap());
+                    ui.add_space(4.0);
+                    let label_w = (ui.available_width() * 0.6).max(200.0);
+                    egui::Grid::new(("insight", ins.kind)).num_columns(3).striped(true).show(ui, |ui| {
+                        for it in &ins.items {
+                            ui.allocate_ui(egui::vec2(label_w, 18.0), |ui| {
+                                ui.set_max_width(label_w);
+                                if link_trunc(ui, &it.label).on_hover_text(&it.label).clicked() {
+                                    follow = Some(it.link.clone());
+                                }
+                            });
+                            ui.label(RichText::new(&it.value).monospace());
+                            ui.allocate_ui(egui::vec2(160.0, 12.0), |ui| data_bar(ui, it.weight, color));
+                            ui.end_row();
+                        }
+                    });
+                    if ins.total_items > ins.items.len() {
+                        ui.label(RichText::new(format!("… {} more", ins.total_items - ins.items.len())).weak());
+                    }
+                });
+                if scroll == Some(ins.kind) {
+                    ui.scroll_to_rect(r.response.rect, Some(egui::Align::TOP));
+                }
+                ui.add_space(8.0);
+            }
+        });
+        if let Some(l) = follow {
+            self.follow(m, &l);
+        }
+    }
+
+    /// Navigate to what an insight item refers to.
+    fn follow(&mut self, m: &Model, link: &Link) {
+        match link {
+            Link::Function { func } => self.show_methods(MGroup::Function, func.clone()),
+            Link::Location { file, line } => self.show_methods(MGroup::Location, format!("{file}:{line}")),
+            Link::Specializations { method, .. } => {
+                if let Some(c) = m.cis.iter().find(|c| c.def == Some(*method)) {
+                    self.ci_group = CiGroup::Method;
+                    self.ci_group_sel = Some(ci_group_key(c, CiGroup::Method));
+                    self.ci_filter.clear();
+                    self.ci_groups.key.clear();
+                    self.ci_sort.key.clear();
+                    self.tab = Tab::Compiled;
+                }
+            }
+            Link::Object { obj, .. } => self.select(*obj),
+        }
+    }
+
+    fn show_methods(&mut self, g: MGroup, key: String) {
+        self.m_group = g;
+        self.m_group_sel = Some(key);
+        self.m_filter.clear();
+        self.m_groups.key.clear();
+        self.m_sort.key.clear();
+        self.tab = Tab::Methods;
+    }
+
     fn show_type(&mut self, m: &Model, key: &str) {
         self.obj_exact = m.keys.iter().position(|k| k == key).map(|i| i as u32);
         self.obj_filter.clear();
@@ -693,9 +1004,7 @@ impl App {
         let mut clicked = None;
         let mut sort = std::mem::take(&mut self.heap_sort);
         let order = sort.order.clone();
-        TableBuilder::new(ui)
-            .striped(true)
-            .sense(Sense::click())
+        clickable_table(ui)
             .column(Column::remainder().at_least(300.0).clip(true).resizable(true))
             .column(Column::exact(90.0))
             .column(Column::exact(100.0))
@@ -716,7 +1025,7 @@ impl App {
                     row.col(|ui| { ui.label(RichText::new(human(r.bytes)).monospace()); });
                     row.col(|ui| { ui.label(RichText::new(format!("{:.1}", 100.0 * r.bytes as f64 / total as f64)).monospace().weak()); });
                     row.col(|ui| data_bar(ui, r.bytes as f32 / max as f32, color));
-                    if row.response().clicked() {
+                    if row.response().on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         clicked = Some(r.key.clone());
                     }
                 });
@@ -741,7 +1050,7 @@ impl App {
             if let Some(k) = self.obj_exact {
                 ui.label("type =");
                 ui.strong(&m.keys[k as usize]);
-                if ui.small_button("✕").clicked() {
+                if ui.small_button("×").clicked() {
                     self.obj_exact = None;
                     self.obj_rows.key.clear();
                 }
@@ -774,9 +1083,7 @@ impl App {
         let mut sort = std::mem::take(&mut self.obj_rows);
         let order = sort.order.clone();
         let sel = self.selected();
-        TableBuilder::new(ui)
-            .striped(true)
-            .sense(Sense::click())
+        clickable_table(ui)
             .column(Column::exact(130.0))
             .column(Column::exact(80.0))
             .column(Column::initial(220.0).clip(true).resizable(true))
@@ -796,7 +1103,7 @@ impl App {
                     row.col(|ui| { ui.label(RichText::new(e.size.to_string()).monospace()); });
                     row.col(|ui| { ui.label(&m.keys[m.obj_key[i] as usize]); });
                     row.col(|ui| { ui.label(m.w.show(Val::Obj(e.obj), 3)); });
-                    if row.response().clicked() {
+                    if row.response().on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         clicked = Some(e.obj);
                     }
                 });
@@ -833,7 +1140,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(format!("{:?} =", self.ci_group).to_lowercase());
                 ui.strong(&sel);
-                if ui.small_button("✕").clicked() {
+                if ui.small_button("×").clicked() {
                     self.ci_group_sel = None;
                     self.ci_sort.key.clear();
                 }
@@ -877,9 +1184,7 @@ impl App {
         let order = sort.order.clone();
         let sel = self.selected();
         let mut clicked = None;
-        TableBuilder::new(ui)
-            .striped(true)
-            .sense(Sense::click())
+        clickable_table(ui)
             .column(Column::exact(70.0))
             .column(Column::exact(70.0))
             .column(Column::exact(70.0))
@@ -907,7 +1212,7 @@ impl App {
                         let ext = if c.external_method { RichText::new(format!("{}.{}{}", c.module, c.method, c.spec)).italics() } else { RichText::new(format!("{}.{}{}", c.module, c.method, c.spec)) };
                         ui.label(ext).on_hover_text(format!("{}:{}{}", c.file, c.line, if c.external_method { "\nmethod defined in another image" } else { "" }));
                     });
-                    if row.response().clicked() {
+                    if row.response().on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         clicked = Some(c.obj);
                     }
                 });
@@ -953,9 +1258,7 @@ impl App {
         let color = bar_color(ui);
         let mut sort = std::mem::take(&mut self.ci_groups);
         let mut clicked = None;
-        TableBuilder::new(ui)
-            .striped(true)
-            .sense(Sense::click())
+        clickable_table(ui)
             .column(Column::remainder().at_least(300.0).clip(true))
             .column(Column::exact(70.0))
             .column(Column::exact(90.0))
@@ -979,7 +1282,7 @@ impl App {
                     row.col(|ui| { ui.label(RichText::new(human(*inf)).monospace()); });
                     row.col(|ui| { ui.label(RichText::new(format!("{ms:.1}")).monospace()); });
                     row.col(|ui| data_bar(ui, *nat as f32 / max as f32, color));
-                    if row.response().clicked() {
+                    if row.response().on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         clicked = Some(k.clone());
                     }
                 });
@@ -993,24 +1296,53 @@ impl App {
 
     fn methods(&mut self, ui: &mut Ui, m: &Model) {
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.m_filter).hint_text("filter").desired_width(300.0));
-            ui.label(RichText::new(format!("{} methods", m.methods.len())).weak());
+            ui.label("Group by");
+            for (g, name) in [(MGroup::None, "none"), (MGroup::Function, "function"), (MGroup::Location, "source line")] {
+                if ui.selectable_label(self.m_group == g, name).clicked() {
+                    self.m_group = g;
+                    self.m_group_sel = None;
+                    self.m_groups.key.clear();
+                    self.m_sort.key.clear();
+                }
+            }
         });
-        let key = format!("{}{}{}", self.m_filter, self.m_sort.col, self.m_sort.desc);
+        if self.m_group != MGroup::None && self.m_group_sel.is_none() {
+            self.m_group_table(ui, m);
+            return;
+        }
+        if let Some(sel) = self.m_group_sel.clone() {
+            ui.horizontal(|ui| {
+                ui.label(if self.m_group == MGroup::Function { "function =" } else { "defined at" });
+                ui.strong(&sel);
+                if ui.small_button("×").clicked() {
+                    self.m_group_sel = None;
+                    self.m_sort.key.clear();
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.m_filter).hint_text("filter").desired_width(300.0));
+            ui.label(RichText::new(format!("{} of {} methods", self.m_sort.order.len(), m.methods.len())).weak());
+        });
+        let key = format!("{}{}{}{:?}", self.m_filter, self.m_sort.col, self.m_sort.desc, self.m_group_sel);
         if self.m_sort.key != key {
             let f = self.m_filter.to_lowercase();
+            let (g, gsel) = (self.m_group, self.m_group_sel.clone());
             let mut order: Vec<usize> = (0..m.methods.len())
                 .filter(|&i| {
                     let r = &m.methods[i];
-                    f.is_empty() || [&r.name, &r.module, &r.file, &r.sig].iter().any(|s| s.to_lowercase().contains(&f))
+                    gsel.as_ref().is_none_or(|s| m_group_key(r, g) == *s)
+                        && (f.is_empty() || [&r.func, &r.name, &r.module, &r.file, &r.sig].iter().any(|s| s.to_lowercase().contains(&f)))
                 })
                 .collect();
             let sc = self.m_sort.col;
             order.sort_by(|&a, &b| {
                 let (x, y) = (&m.methods[a], &m.methods[b]);
                 match sc {
-                    0 => (&x.module, &x.name).cmp(&(&y.module, &y.name)),
+                    0 => (&x.func, &x.module).cmp(&(&y.func, &y.module)),
                     1 => x.sig.cmp(&y.sig),
+                    2 => m.method_cis[a].0.cmp(&m.method_cis[b].0),
+                    3 => m.method_cis[a].1.cmp(&m.method_cis[b].1),
                     _ => (&x.file, x.line).cmp(&(&y.file, y.line)),
                 }
             });
@@ -1025,30 +1357,48 @@ impl App {
         let mut clicked = None;
         let mut goto_src = None;
         let sel = self.selected();
-        TableBuilder::new(ui)
-            .striped(true)
-            .sense(Sense::click())
+        let warn = ui.visuals().warn_fg_color;
+        clickable_table(ui)
             .column(Column::initial(260.0).clip(true).resizable(true))
             .column(Column::initial(380.0).clip(true).resizable(true))
+            .column(Column::exact(50.0))
+            .column(Column::exact(70.0))
             .column(Column::remainder().clip(true))
             .header(20.0, |mut h| {
-                h.col(|ui| sort_header(ui, "method", 0, &mut sort, false));
+                h.col(|ui| sort_header(ui, "function", 0, &mut sort, false));
                 h.col(|ui| sort_header(ui, "signature", 1, &mut sort, false));
-                h.col(|ui| sort_header(ui, "location", 2, &mut sort, false));
+                h.col(|ui| sort_header(ui, "CIs", 2, &mut sort, true));
+                h.col(|ui| sort_header(ui, "native", 3, &mut sort, true));
+                h.col(|ui| sort_header(ui, "location", 4, &mut sort, false));
             })
             .body(|body| {
                 body.rows(18.0, order.len(), |mut row| {
-                    let r = &m.methods[order[row.index()]];
+                    let i = order[row.index()];
+                    let r = &m.methods[i];
                     row.set_selected(sel == Some(r.obj));
-                    row.col(|ui| { ui.label(format!("{}.{}", r.module, r.name)); });
+                    row.col(|ui| {
+                        if r.pirate {
+                            ui.label(RichText::new("⚠").color(warn)).on_hover_text("possible type piracy: no argument type is from this package");
+                        }
+                        let name = if r.kwcall { format!("{} (kw)", r.func) } else { r.func.clone() };
+                        let text = if r.func_external { RichText::new(name).italics() } else { RichText::new(name) };
+                        ui.label(text).on_hover_text(format!(
+                            "method {} defined in module {}{}{}", r.name, r.module,
+                            if r.kwcall { "\nkeyword-argument method (Core.kwcall)" } else { "" },
+                            if r.func_external { "\nfunction owned by another module" } else { "" },
+                        ));
+                    });
                     row.col(|ui| { ui.label(&r.sig); });
+                    let (n, nat) = m.method_cis[i];
+                    row.col(|ui| { ui.label(RichText::new(n.to_string()).monospace()); });
+                    row.col(|ui| { ui.label(RichText::new(human(nat)).monospace()); });
                     row.col(|ui| {
                         let short = r.file.rsplit('/').next().unwrap_or("");
                         if ui.link(format!("{short}:{}", r.line)).on_hover_text(&r.file).clicked() {
                             goto_src = Some((r.file.clone(), r.line));
                         }
                     });
-                    if row.response().clicked() {
+                    if row.response().on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         clicked = Some(r.obj);
                     }
                 });
@@ -1059,6 +1409,71 @@ impl App {
         }
         if let Some((f, l)) = goto_src {
             self.goto_source(m, &f, l);
+        }
+    }
+
+    fn m_group_table(&mut self, ui: &mut Ui, m: &Model) {
+        let g = self.m_group;
+        let key = format!("{:?}|{}|{}", g, self.m_groups.col, self.m_groups.desc);
+        if self.m_groups.key != key {
+            let mut groups: HashMap<String, (u64, u64, u64, bool)> = HashMap::new();
+            for (r, (n, nat)) in m.methods.iter().zip(&m.method_cis) {
+                let e = groups.entry(m_group_key(r, g)).or_default();
+                e.0 += 1;
+                e.1 += *n as u64;
+                e.2 += nat;
+                e.3 |= r.func_external;
+            }
+            let mut v: Vec<_> = groups.into_iter().collect();
+            let (sc, desc) = (self.m_groups.col, self.m_groups.desc);
+            v.sort_by(|a, b| {
+                let o = match sc {
+                    0 => a.0.cmp(&b.0),
+                    1 => a.1.0.cmp(&b.1.0),
+                    2 => a.1.1.cmp(&b.1.1),
+                    _ => a.1.2.cmp(&b.1.2),
+                };
+                (if desc { o.reverse() } else { o }).then_with(|| a.0.cmp(&b.0))
+            });
+            self.m_group_rows = v;
+            self.m_groups.key = key;
+        }
+        let rows = &self.m_group_rows;
+        ui.label(RichText::new(format!("{} groups · italic: function owned by another module", rows.len())).weak());
+        let max = rows.iter().map(|r| r.1.0).max().unwrap_or(1).max(1);
+        let color = bar_color(ui);
+        let mut sort = std::mem::take(&mut self.m_groups);
+        let mut clicked = None;
+        clickable_table(ui)
+            .column(Column::remainder().at_least(300.0).clip(true))
+            .column(Column::exact(70.0))
+            .column(Column::exact(70.0))
+            .column(Column::exact(90.0))
+            .column(Column::exact(140.0))
+            .header(20.0, |mut h| {
+                h.col(|ui| sort_header(ui, "group", 0, &mut sort, false));
+                h.col(|ui| sort_header(ui, "methods", 1, &mut sort, true));
+                h.col(|ui| sort_header(ui, "CIs", 2, &mut sort, true));
+                h.col(|ui| sort_header(ui, "native", 3, &mut sort, true));
+                h.col(|_| {});
+            })
+            .body(|body| {
+                body.rows(18.0, rows.len(), |mut row| {
+                    let (k, (n, cis, nat, ext)) = &rows[row.index()];
+                    row.col(|ui| { ui.label(if *ext { RichText::new(k).italics() } else { RichText::new(k) }); });
+                    row.col(|ui| { ui.label(RichText::new(n.to_string()).monospace()); });
+                    row.col(|ui| { ui.label(RichText::new(cis.to_string()).monospace()); });
+                    row.col(|ui| { ui.label(RichText::new(human(*nat)).monospace()); });
+                    row.col(|ui| data_bar(ui, *n as f32 / max as f32, color));
+                    if row.response().on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        clicked = Some(k.clone());
+                    }
+                });
+            });
+        self.m_groups = sort;
+        if let Some(k) = clicked {
+            self.m_group_sel = Some(k);
+            self.m_sort.key.clear();
         }
     }
 
@@ -1115,16 +1530,29 @@ impl App {
 
     fn deps(&mut self, ui: &mut Ui, m: &Model) {
         let Some(p) = &m.w.target().header.pkg else { return };
+        let mut open = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
+            if cfg!(not(target_arch = "wasm32")) {
+                ui.label(RichText::new("Click a package to open its image in a new tab.").weak());
+            }
             egui::Grid::new("deps").num_columns(3).striped(true).show(ui, |ui| {
                 ui.strong("module");
                 ui.strong("uuid");
                 ui.strong("resolved to");
                 ui.end_row();
                 for d in &p.required_modules {
-                    ui.label(&d.name);
-                    ui.label(RichText::new(&d.uuid).monospace().weak());
                     let found = m.w.images.iter().find(|im| im.header.pkg.as_ref().is_some_and(|pk| pk.worklist.iter().any(|x| x.name == d.name && x.build_id_lo == d.build_id_lo)));
+                    match found {
+                        Some(im) if cfg!(not(target_arch = "wasm32")) => {
+                            if ui.link(&d.name).on_hover_text(format!("open {} in a new tab", im.path.display())).clicked() {
+                                open = Some(image_load(m, im));
+                            }
+                        }
+                        _ => {
+                            ui.label(&d.name);
+                        }
+                    }
+                    ui.label(RichText::new(&d.uuid).monospace().weak());
                     let missing = m.w.missing.iter().any(|x| x.name == d.name && x.uuid == d.uuid);
                     match (found, missing) {
                         (Some(im), _) => ui.label(im.path.display().to_string()),
@@ -1135,6 +1563,9 @@ impl App {
                 }
             });
         });
+        if open.is_some() {
+            self.open_request = open;
+        }
     }
 
     fn val_ui(&self, ui: &mut Ui, m: &Model, v: Val, nav: &mut Option<Obj>) {
@@ -1169,7 +1600,7 @@ impl App {
             }
             ui.strong("Inspector");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("✕").clicked() {
+                if ui.button("×").clicked() {
                     self.history.clear();
                     self.hist_pos = 0;
                 }
@@ -1194,13 +1625,21 @@ impl App {
                 }
             });
             let size = m.find(o).map(|i| m.entry(i).size);
-            ui.label(RichText::new(format!(
-                "{} @ {}{}{}",
-                w.img(o.img).display_name(),
-                if o.cst { "const+" } else { "" },
-                o.off,
-                size.map(|s| format!("  ·  {s} bytes")).unwrap_or_default()
-            )).weak().monospace());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!(
+                    "{} @ {}{}{}",
+                    w.img(o.img).display_name(),
+                    if o.cst { "const+" } else { "" },
+                    o.off,
+                    size.map(|s| format!("  ·  {s} bytes")).unwrap_or_default()
+                )).weak().monospace());
+                let im = w.img(o.img);
+                if o.img != w.target && im.header.pkg.is_some() && cfg!(not(target_arch = "wasm32"))
+                    && ui.small_button(format!("Open {}", im.display_name())).on_hover_text("open this image in a new tab").clicked()
+                {
+                    self.open_request = Some(image_load(m, im));
+                }
+            });
             if let Some(s) = inspect::string_value(w, o) {
                 ui.add_space(4.0);
                 let shown: String = s.chars().take(2000).collect();
@@ -1329,7 +1768,7 @@ fn same_file(method_file: &str, src: &str) -> bool {
 /// A single-line, truncated hyperlink (full text on hover).
 fn link_trunc(ui: &mut Ui, text: &str) -> egui::Response {
     let color = ui.visuals().hyperlink_color;
-    let r = ui.add(egui::Label::new(RichText::new(text).color(color)).truncate().sense(Sense::click()));
+    let r = ui.add(egui::Label::new(RichText::new(text).color(color)).selectable(false).truncate().sense(Sense::click()));
     if r.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -1368,35 +1807,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn completed_load_clears_previous_image_selection() {
+    fn clicking_table_text_selects_the_row() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([600.0, 200.0])
+            .build_ui_state(|ui, clicked| {
+                clickable_table(ui)
+                    .column(Column::exact(100.0))
+                    .column(Column::remainder())
+                    .body(|body| {
+                        body.rows(20.0, 1, |mut row| {
+                            row.col(|ui| { ui.label(RichText::new("1234").monospace()); });
+                            row.col(|ui| { ui.label(RichText::new("Example.f(Int64)").italics()); });
+                            if row.response().on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                *clicked += 1;
+                            }
+                        });
+                    });
+            }, 0);
+        for label in ["Example.f(Int64)", "1234"] {
+            harness.get_by_label(label).hover();
+            harness.run();
+            assert_eq!(harness.output().platform_output.cursor_icon, egui::CursorIcon::PointingHand);
+            harness.get_by_label(label).click();
+            harness.run();
+        }
+        assert_eq!(*harness.state(), 2);
+    }
+
+    #[test]
+    fn opening_an_open_file_switches_to_its_tab() {
         let mut harness = egui_kittest::Harness::builder().build_eframe(|cc| App::new(cc, None));
-        let (tx, rx) = mpsc::channel();
+        let ctx = harness.ctx.clone();
         let app = harness.state_mut();
-        app.obj_exact = Some(u32::MAX);
-        app.ci_group_sel = Some("old method".into());
-        app.obj_rows.order = vec![usize::MAX];
-        app.src_sel = 100;
-        app.history.push(Obj { img: 10, off: 128, cst: false });
-        app.hist_pos = 1;
-        app.state = State::Loading(rx, "new image".into());
-        tx.send(Err("test load failure".into())).unwrap();
-        harness.step();
-        let app = harness.state();
-        assert!(matches!(app.state, State::Failed(_)));
-        assert!(app.obj_exact.is_none());
-        assert!(app.obj_rows.order.is_empty());
-        assert!(app.ci_group_sel.is_none());
-        assert!(app.history.is_empty());
-        assert_eq!(app.src_sel, 0);
+        app.open(&ctx, Load::Paths(vec!["/nonexistent/A.ji".into()], None));
+        app.open(&ctx, Load::Paths(vec!["/nonexistent/B.ji".into()], None));
+        assert_eq!((app.docs.len(), app.active), (2, 1));
+        app.docs[0].obj_filter = "kept".into();
+        app.open(&ctx, Load::Paths(vec!["/nonexistent/A.ji".into()], None));
+        assert_eq!((app.docs.len(), app.active), (2, 0));
+        // A different system image is a different view of the file.
+        app.open(&ctx, Load::Paths(vec!["/nonexistent/A.ji".into()], Some("/nonexistent/sys.so".into())));
+        assert_eq!((app.docs.len(), app.active), (3, 2));
+        assert!(app.docs[2].obj_filter.is_empty());
+    }
+
+    #[test]
+    fn closing_tabs_keeps_selection_valid() {
+        let mut harness = egui_kittest::Harness::builder().build_eframe(|cc| App::new(cc, None));
+        let app = harness.state_mut();
+        for t in ["a", "b", "c"] {
+            app.push(Doc::new(State::Failed(String::new()), t.into(), None));
+        }
+        app.active = 1;
+        app.close(0);
+        assert_eq!(app.doc().unwrap().title, "b");
+        app.close(1);
+        assert_eq!(app.doc().unwrap().title, "b");
+        app.close(0);
+        assert!(app.doc().is_none());
+        app.close(0);
     }
 
     #[test]
     fn disconnected_loader_displays_failure() {
         let mut harness = egui_kittest::Harness::builder().build_eframe(|cc| App::new(cc, None));
         let (tx, rx) = mpsc::channel();
-        harness.state_mut().state = State::Loading(rx, "image".into());
+        harness.state_mut().push(Doc::new(State::Loading(rx, "image".into()), "image".into(), None));
         drop(tx);
         harness.step();
-        assert!(matches!(&harness.state().state, State::Failed(e) if e.contains("stopped unexpectedly")));
+        assert!(matches!(&harness.state().docs[0].state, State::Failed(e) if e.contains("stopped unexpectedly")));
     }
 }
