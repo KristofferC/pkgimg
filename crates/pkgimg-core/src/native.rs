@@ -25,6 +25,8 @@ pub struct NativeInfo {
     pub ngvars: u32,
     pub nshards: u32,
     pub cpu_target: Option<String>,
+    /// Function address -> (count, bytes) of its clones for other CPU targets (`name.1`, `name.2`, ...).
+    pub clones: HashMap<u64, (u32, u64)>,
 }
 
 impl NativeInfo {
@@ -33,6 +35,16 @@ impl NativeInfo {
         let i = self.funcs.partition_point(|f| f.addr <= addr);
         let f = self.funcs.get(i.checked_sub(1)?)?;
         (addr < f.addr + f.size.max(1)).then_some(f)
+    }
+
+    /// Bytes of the CPU-target clones of the function starting at `addr`.
+    pub fn clone_bytes(&self, addr: u64) -> u64 {
+        self.clones.get(&addr).map_or(0, |c| c.1)
+    }
+
+    /// Bytes of DWARF debug sections.
+    pub fn debug_size(&self) -> u64 {
+        self.sections.iter().filter(|(n, _)| n.starts_with(".debug") || n.starts_with("__debug")).map(|s| s.1).sum()
     }
 }
 
@@ -159,6 +171,18 @@ pub fn parse(buf: &[u8]) -> Result<NativeInfo> {
         .collect();
     funcs.sort_by_key(|f| f.addr);
     funcs.dedup_by_key(|f| f.addr);
+    let by_name: HashMap<&str, u64> = funcs.iter().map(|f| (f.name.as_str(), f.addr)).collect();
+    for f in &funcs {
+        let Some((base, n)) = f.name.rsplit_once('.') else { continue };
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if let Some(&a) = by_name.get(base) {
+            let e = info.clones.entry(a).or_default();
+            e.0 += 1;
+            e.1 += f.size;
+        }
+    }
     info.funcs = funcs;
 
     let Some(ptrs) = find_symbol(&file, "jl_image_pointers").or_else(|| find_symbol(&file, "_jl_image_pointers"))

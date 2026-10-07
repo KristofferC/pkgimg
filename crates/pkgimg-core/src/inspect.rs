@@ -18,7 +18,7 @@ pub struct FieldView {
     pub value: FieldValue,
 }
 
-fn fmt_bits(ty: &str, b: &[u8]) -> String {
+pub(crate) fn fmt_bits(ty: &str, b: &[u8]) -> String {
     let u = |n: usize| -> u64 {
         let mut x = [0u8; 8];
         x[..n.min(b.len())].copy_from_slice(&b[..n.min(b.len())]);

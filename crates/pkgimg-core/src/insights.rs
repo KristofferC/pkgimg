@@ -71,14 +71,6 @@ fn human(b: u64) -> String {
     }
 }
 
-fn short_file(f: &str) -> &str {
-    // Keep the package-relative part: `src/derivatives/arrays.jl`.
-    match f.rfind("/src/") {
-        Some(i) => &f[i + 1..],
-        None => f.rsplit('/').next().unwrap_or(f),
-    }
-}
-
 /// Keep the largest `MAX_ITEMS` of `rows` (sorted by `key` descending) as items.
 fn top<T>(mut rows: Vec<T>, key: impl Fn(&T) -> f64, item: impl Fn(&T, f32) -> Item) -> (Vec<Item>, usize) {
     rows.sort_by(|a, b| key(b).total_cmp(&key(a)));
@@ -139,7 +131,7 @@ fn generated_methods(methods: &[MethodRow]) -> Option<Insight> {
     let in_rows: usize = rows.iter().map(|r| r.1.0).sum();
     let severity = if n >= 300 { Severity::High } else { Severity::Notable };
     let (items, total_items) = top(rows, |r| r.1.0 as f64, |r, w| Item {
-        label: format!("{}:{}", short_file(r.0.0), r.0.1),
+        label: format!("{}:{}", crate::analysis::short_path(r.0.0), r.0.1),
         value: format!("{} ({})", plural(r.1.0, "method"), r.1.1.join(", ")),
         weight: w,
         link: Link::Location { file: r.0.0.to_string(), line: r.0.1 },
@@ -189,29 +181,39 @@ fn piracy(w: &World, methods: &[MethodRow]) -> Option<Insight> {
     })
 }
 
-/// Per-method aggregates of code instances: (count, native bytes, inference ms).
-fn ci_by_method(cis: &[CiRow]) -> HashMap<Obj, (usize, u64, f32, &CiRow)> {
-    let mut by: HashMap<Obj, (usize, u64, f32, &CiRow)> = HashMap::new();
+/// Per-method aggregates of code instances: (count, native bytes, inference ms, label).
+fn ci_by_method(w: &World, cis: &[CiRow]) -> HashMap<Obj, (usize, u64, f32, String)> {
+    let mut by: HashMap<Obj, (usize, u64, f32, String)> = HashMap::new();
     for c in cis {
         let Some(d) = c.def else { continue };
-        let e = by.entry(d).or_insert((0, 0, 0.0, c));
+        let e = by.entry(d).or_insert_with(|| (0, 0, 0.0, ci_label(c)));
         e.0 += 1;
-        e.1 += c.native_bytes + c.wrapper_bytes;
+        e.1 += c.native_total();
         e.2 += c.infer_self_ms;
+    }
+    // Methods that share a name and line (e.g. `f(x)` and `f(x, y)` from one definition).
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for v in by.values() {
+        *seen.entry(v.3.clone()).or_default() += 1;
+    }
+    for (d, v) in by.iter_mut() {
+        if seen[&v.3] > 1 {
+            v.3 = format!("{}  {}", v.3, crate::analysis::method_info(w, *d).sig);
+        }
     }
     by
 }
 
 fn ci_label(c: &CiRow) -> String {
-    format!("{}.{}  ({}:{})", c.module, c.method, short_file(&c.file), c.line)
+    format!("{}.{}  ({}:{})", c.module, c.method, crate::analysis::short_path(&c.file), c.line)
 }
 
-fn specializations(cis: &[CiRow]) -> Option<Insight> {
-    let rows: Vec<_> = ci_by_method(cis).into_iter().filter(|r| r.1.0 >= 30).collect();
+fn specializations(w: &World, cis: &[CiRow]) -> Option<Insight> {
+    let rows: Vec<_> = ci_by_method(w, cis).into_iter().filter(|r| r.1.0 >= 30).collect();
     let n = rows.iter().map(|r| r.1.0).max()?;
     let severity = if n >= 100 { Severity::High } else { Severity::Notable };
     let (items, total_items) = top(rows, |r| r.1.0 as f64, |r, w| Item {
-        label: ci_label(r.1.3),
+        label: r.1.3.clone(),
         value: format!("{} · {} native", plural(r.1.0, "specialization"), human(r.1.1)),
         weight: w,
         link: Link::Specializations { method: r.0, offset: r.0.off },
@@ -228,17 +230,17 @@ fn specializations(cis: &[CiRow]) -> Option<Insight> {
     })
 }
 
-fn native_concentration(cis: &[CiRow]) -> Option<Insight> {
-    let total: u64 = cis.iter().map(|c| c.native_bytes + c.wrapper_bytes).sum();
+fn native_concentration(w: &World, cis: &[CiRow]) -> Option<Insight> {
+    let total: u64 = cis.iter().map(|c| c.native_total()).sum();
     if total < 64 << 10 {
         return None;
     }
-    let rows: Vec<_> = ci_by_method(cis).into_iter().filter(|r| r.1.1 > 0).collect();
+    let rows: Vec<_> = ci_by_method(w, cis).into_iter().filter(|r| r.1.1 > 0).collect();
     let max = rows.iter().map(|r| r.1.1).max()?;
     let share = max as f64 / total as f64;
     let severity = if share >= 0.25 && max >= 256 << 10 { Severity::Notable } else { Severity::Info };
     let (items, total_items) = top(rows, |r| r.1.1 as f64, |r, w| Item {
-        label: ci_label(r.1.3),
+        label: r.1.3.clone(),
         value: format!("{} ({:.0}%) · {}", human(r.1.1), 100.0 * r.1.1 as f64 / total as f64, plural(r.1.0, "CI")),
         weight: w,
         link: Link::Specializations { method: r.0, offset: r.0.off },
@@ -255,14 +257,14 @@ fn native_concentration(cis: &[CiRow]) -> Option<Insight> {
     })
 }
 
-fn inference_time(cis: &[CiRow]) -> Option<Insight> {
+fn inference_time(w: &World, cis: &[CiRow]) -> Option<Insight> {
     let total: f32 = cis.iter().map(|c| c.infer_self_ms).sum();
     if total < 50.0 {
         return None;
     }
-    let rows: Vec<_> = ci_by_method(cis).into_iter().filter(|r| r.1.2 > 0.0).collect();
+    let rows: Vec<_> = ci_by_method(w, cis).into_iter().filter(|r| r.1.2 > 0.0).collect();
     let (items, total_items) = top(rows, |r| r.1.2 as f64, |r, w| Item {
-        label: ci_label(r.1.3),
+        label: r.1.3.clone(),
         value: format!("{:.1} ms · {}", r.1.2, plural(r.1.0, "CI")),
         weight: w,
         link: Link::Specializations { method: r.0, offset: r.0.off },
@@ -287,7 +289,7 @@ fn dead_code(cis: &[CiRow]) -> Option<Insight> {
     let frac = dead.len() as f64 / cis.len().max(1) as f64;
     let severity = if dead.len() >= 20 || frac >= 0.05 { Severity::Notable } else { Severity::Info };
     let (items, total_items) = top(dead.clone(), |c| (c.inferred_bytes + c.native_bytes) as f64, |c, w| Item {
-        label: format!("{}.{}{}", c.module, c.method, c.spec),
+        label: c.label(),
         value: format!("{} inferred", human(c.inferred_bytes)),
         weight: w,
         link: Link::object(c.obj),
@@ -334,11 +336,11 @@ pub fn insights(w: &World, objs: &[ObjEntry], cst: &[ObjEntry], methods: &[Metho
     let mut v: Vec<Insight> = [
         many_methods(methods),
         generated_methods(methods),
-        specializations(cis),
+        specializations(w, cis),
         piracy(w, methods),
         dead_code(cis),
-        native_concentration(cis),
-        inference_time(cis),
+        native_concentration(w, cis),
+        inference_time(w, cis),
         large_objects(w, objs, cst),
     ]
     .into_iter()

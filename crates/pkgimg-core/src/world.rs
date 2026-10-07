@@ -835,8 +835,8 @@ impl World {
                                 if i > 0 {
                                     s.push_str(", ");
                                 }
-                                if i >= 8 {
-                                    s.push('…');
+                                if i >= 32 {
+                                    write!(s, "…({} more)", dt.params.len() - i).unwrap();
                                     break;
                                 }
                                 self.show_into(s, *p, depth - 1);
@@ -943,6 +943,57 @@ impl World {
                         }
                     }
                     Kind::Module => s.push_str(&self.module_path(o)),
+                    Kind::Binding => match self.field(o, "globalref") {
+                        Some(g @ Val::Obj(_)) => {
+                            s.push_str("Binding ");
+                            self.show_into(s, g, depth - 1);
+                        }
+                        _ => s.push_str("<Binding>"),
+                    },
+                    _ if ti.module == "Core" && ti.name == "GlobalRef" => {
+                        let m = self.field(o, "mod").and_then(|v| v.obj()).map(|m| self.module_path(m).to_string()).unwrap_or_default();
+                        let n = self.field(o, "name").and_then(|v| self.sym_name(v)).unwrap_or_default();
+                        write!(s, "{m}.{n}").unwrap();
+                    }
+                    _ if ti.module == "Core" && ti.name == "TypeofBottom" => s.push_str("Union{}"),
+                    _ if ti.module == "Core" && ti.name == "TypeofVararg" => {
+                        s.push_str("Vararg");
+                        let t = self.field(o, "T").filter(|v| !matches!(v, Val::Null));
+                        let n = self.field(o, "N").filter(|v| !matches!(v, Val::Null));
+                        if let Some(t) = t {
+                            s.push('{');
+                            self.show_into(s, t, depth - 1);
+                            if let Some(n) = n {
+                                s.push_str(", ");
+                                self.show_into(s, n, depth - 1);
+                            }
+                            s.push('}');
+                        }
+                    }
+                    _ if ti.module == "Core" && ti.name == "Tuple" && ti.layout.is_some() => {
+                        // Tuple values, e.g. the field names of a `NamedTuple` type.
+                        let l = ti.layout.as_ref().unwrap();
+                        s.push('(');
+                        for (i, f) in l.fields.iter().enumerate() {
+                            if i > 0 {
+                                s.push_str(", ");
+                            }
+                            if i >= 32 {
+                                write!(s, "…({} more)", l.fields.len() - i).unwrap();
+                                break;
+                            }
+                            if f.isptr {
+                                self.show_into(s, self.ptr(o, f.offset), depth - 1);
+                            } else {
+                                let fty = ti.field_types.get(i).and_then(|t| t.obj()).and_then(|t| self.datatype(t)).map(|d| d.name.clone()).unwrap_or_default();
+                                s.push_str(&crate::inspect::fmt_bits(&fty, self.bytes(o, f.offset, f.size)));
+                            }
+                        }
+                        if l.fields.len() == 1 {
+                            s.push(',');
+                        }
+                        s.push(')');
+                    }
                     _ if ti.module == "Core" && (ti.name == "TypeEq" || ti.name == "TypeEgal") => {
                         s.push_str(if ti.name == "TypeEq" { "Type{" } else { "TypeEgal{" });
                         self.show_into(s, self.ptr(o, 0), depth - 1);
@@ -963,6 +1014,14 @@ impl World {
                                 }
                                 _ => {}
                             }
+                        }
+                        if let Some(l) = lay.filter(|l| l.nfields == 0 && l.size > 0 && l.size <= 8) {
+                            // Other primitive values, e.g. `Core.CPU::AddrSpace{Core}`
+                            let b = self.bytes(o, 0, l.size);
+                            if ti.module == "Core" && ti.name == "AddrSpace" && b == [0] {
+                                return s.push_str("CPU");
+                            }
+                            return write!(s, "{}({})", ti.name, crate::inspect::fmt_bits("", b)).unwrap();
                         }
                         if ti.layout.as_ref().is_some_and(|l| l.size == 0) && ti.field_names.is_empty() {
                             // singleton instance

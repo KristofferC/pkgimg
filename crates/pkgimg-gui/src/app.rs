@@ -57,7 +57,7 @@ enum CiGroup {
 fn ci_group_key(c: &pkgimg_core::analysis::CiRow, g: CiGroup) -> String {
     match g {
         CiGroup::None => String::new(),
-        CiGroup::Method => format!("{}.{} @ {}:{}", c.module, c.method, c.file.rsplit('/').next().unwrap_or(""), c.line),
+        CiGroup::Method => format!("{}.{} @ {}:{}", c.module, c.method, pkgimg_core::analysis::short_path(&c.file), c.line),
         CiGroup::File => c.file.clone(),
         CiGroup::Module => c.module.clone(),
         CiGroup::Root => c.root.clone().unwrap_or_else(|| "<no provenance record>".into()),
@@ -1229,7 +1229,7 @@ impl Doc {
                 .filter(|&i| {
                     let c = &m.cis[i];
                     gsel.as_ref().is_none_or(|s| ci_group_key(c, g) == *s)
-                        && (f.is_empty() || [&c.method, &c.module, &c.file, &c.spec].iter().any(|s| s.to_lowercase().contains(&f)))
+                        && (f.is_empty() || [&c.label(), &c.file].iter().any(|s| s.to_lowercase().contains(&f)))
                 })
                 .collect();
             let sc = self.ci_sort.col;
@@ -1279,7 +1279,7 @@ impl Doc {
                     row.col(|ui| { ui.label(&c.status); });
                     row.col(|ui| { ui.label(&c.invoke); });
                     row.col(|ui| {
-                        let ext = if c.external_method { RichText::new(format!("{}.{}{}", c.module, c.method, c.spec)).italics() } else { RichText::new(format!("{}.{}{}", c.module, c.method, c.spec)) };
+                        let ext = if c.external_method { RichText::new(c.label()).italics() } else { RichText::new(c.label()) };
                         ui.label(ext).on_hover_text(format!("{}:{}{}", c.file, c.line, if c.external_method { "\nmethod defined in another image" } else { "" }));
                     });
                     if row.response().on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -1714,7 +1714,7 @@ impl Doc {
                 egui::Grid::new("ciextra").num_columns(2).show(ui, |ui| {
                     if let Some(s) = &c.native_symbol {
                         ui.label(RichText::new("native").weak());
-                        ui.label(RichText::new(format!("{s}  ({} B + {} B wrapper)", c.native_bytes, c.wrapper_bytes)).monospace());
+                        ui.label(RichText::new(format!("{s}  ({} B + {} B wrapper, {} B in CPU-target clones)", c.native_bytes, c.wrapper_bytes, c.clone_bytes)).monospace());
                         ui.end_row();
                     }
                     if let Some(p) = &c.parent {

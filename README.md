@@ -23,11 +23,11 @@ The GUI on the `Pkg` stdlib image from Julia 1.13.1:
 pkgimg summary   <file.ji>                   overview: header, sizes, counts, largest types
 pkgimg heap      <file.ji> [--by type|full-type|referrer|section] [--section all|objects|const]
 pkgimg compiled  <file.ji> [--by method|file|module|root|parent] [--sort native|inferred|infer-time|name]
-                           [--filter STR] [--external]
+                           [--filter STR] [--sig STR] [--external]
 pkgimg methods   <file.ji>
 pkgimg insights  <file.ji>                   unusual parts: functions with very many methods, @eval
                                              loops, piracy, many specializations, invalidated code
-pkgimg objects   <file.ji> [--type STR]
+pkgimg objects   <file.ji> [--type STR] [--sort offset|size]
 pkgimg show      <file.ji> <offset> [--const]  decode one object: fields, elements, referrers
 pkgimg why       <file.ji> <offset|substring>  inference chain of a code instance (needs provenance)
 pkgimg diff      <a.ji> <b.ji>                 before/after: code instances per method, heap per type
@@ -56,6 +56,11 @@ includes the resolved system-image path and `missing_dependencies`. Warnings go 
 stderr. Ungrouped `compiled` and `methods` rows include `offset` and `const`, which can
 be passed to `show` (`--const` when true) or used to select a code instance with `why`.
 `sources --show FILE --json` returns source text and its path in a JSON object.
+`compiled --filter` matches the qualified method name (`Pkg.Resolve.Graph`), `--sig` the
+argument and callee types. When the callee type tells specializations apart (closures with
+captured types, `TypeEgal{T}` constructors), rows show `Mod.(::Callee)(args)` and carry it as
+`callee`. Native sizes count one CPU target; `clone_bytes` and `summary` give the clones
+compiled for the other targets of a multiversioned image.
 `methods` rows also give the extended function (`func`), whether another module owns it
 (`func_external`), possible piracy (`pirate`) and whether it is a keyword method
 (`kwcall`, attributed to the function it wraps). `insights --json` returns `insights`,

@@ -291,6 +291,44 @@ fn mentions_module(w: &World, v: Val, own: &[String], depth: u32) -> bool {
     }
 }
 
+/// Nesting depth to which signatures are rendered before eliding with `…`.
+const SIG_DEPTH: u32 = 12;
+
+/// The callee type of a signature when it says more than the method name: closures with
+/// captured types, callable parametric structs, and `TypeEgal{T}` constructors. `None` for
+/// plain functions (`typeof(f)`) and `Type{T}` constructors.
+pub fn sig_callee(w: &World, sig: Val) -> Option<String> {
+    let f = *sig_params(w, sig).first()?;
+    let o = unwrap_unionall(w, f).obj()?;
+    if type_param(w, o).is_some() {
+        return None;
+    }
+    if w.kind(o) == Kind::DataType && w.datatype(o)?.params.is_empty() {
+        return None;
+    }
+    Some(w.show(f, SIG_DEPTH))
+}
+
+/// Package-relative part of a source path: `Pkg/src/Operations.jl` for
+/// `/cache/build/.../stdlib/v1.14/Pkg/src/Operations.jl`, `Foo/src/foo.jl` for
+/// `~/.julia/packages/Foo/AbCd1/src/foo.jl`; relative paths are kept.
+pub fn short_path(f: &str) -> String {
+    if !f.starts_with('/') && !f.contains(":\\") {
+        return f.to_string();
+    }
+    let f = f.replace('\\', "/");
+    let (dir, rest) = match f.rfind("/src/") {
+        Some(i) => (&f[..i], &f[i..]),
+        None => f.rsplit_once('/').map_or(("", f.as_str()), |(d, _)| (d, &f[d.len()..])),
+    };
+    let comps: Vec<&str> = dir.split('/').collect();
+    match comps.as_slice() {
+        [.., "packages", name, _slug] => format!("{name}{rest}"),
+        [.., last] => format!("{last}{rest}"),
+        [] => rest.to_string(),
+    }
+}
+
 /// Render a signature `Tuple{typeof(f), A, B} where T` as `(A, B) where T`.
 pub fn show_sig(w: &World, sig: Val) -> String {
     let mut body = sig;
@@ -307,7 +345,7 @@ pub fn show_sig(w: &World, sig: Val) -> String {
     let Some(dt) = body.obj().filter(|o| w.kind(*o) == Kind::DataType).and_then(|o| w.datatype(o)) else {
         return w.show(sig, 5);
     };
-    let args: Vec<String> = dt.params.iter().skip(1).map(|p| w.show(*p, 4)).collect();
+    let args: Vec<String> = dt.params.iter().skip(1).map(|p| w.show(*p, SIG_DEPTH)).collect();
     let mut s = format!("({})", args.join(", "));
     if !vars.is_empty() {
         s.push_str(&format!(" where {}", vars.join(", ")));
@@ -329,6 +367,9 @@ pub struct CiRow {
     pub file: String,
     pub line: i64,
     pub spec: String,
+    /// Callee type, when it distinguishes specializations (see `sig_callee`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee: Option<String>,
     /// `nothing` for native compilation; otherwise the abstract interpreter's cache owner.
     pub owner: String,
     /// "live" (valid, revalidated on load), "dead" (invalidated before saving), or raw worlds.
@@ -343,6 +384,8 @@ pub struct CiRow {
     #[serde(skip)]
     pub native_addr: Option<u64>,
     pub wrapper_bytes: u64,
+    /// Native code in clones of the function and wrapper for other CPU targets.
+    pub clone_bytes: u64,
     pub infer_self_ms: f32,
     pub infer_total_ms: f32,
     pub rettype: String,
@@ -352,6 +395,21 @@ pub struct CiRow {
     /// From the provenance sidecar: root of that inference (entry point).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
+}
+
+impl CiRow {
+    /// `Mod.f(A, B)`, or `Mod.(::Callee)(A, B)` when the callee type matters.
+    pub fn label(&self) -> String {
+        match &self.callee {
+            Some(c) => format!("{}.(::{c}){}", self.module, self.spec),
+            None => format!("{}.{}{}", self.module, self.method, self.spec),
+        }
+    }
+
+    /// Native code of the specialized function plus its wrapper (one CPU target).
+    pub fn native_total(&self) -> u64 {
+        self.native_bytes + self.wrapper_bytes
+    }
 }
 
 pub fn code_instances(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<CiRow> {
@@ -387,9 +445,12 @@ pub fn code_instances(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<CiRow> {
         }
         let (mut method, mut module, mut file, mut line, mut spec, mut ext) =
             (String::new(), String::new(), String::new(), 0, String::new(), false);
+        let mut callee = None;
         let mut def = None;
         if let Some(mi) = mi {
-            spec = w.field(mi, "specTypes").map(|s| show_sig(w, s)).unwrap_or_default();
+            let st = w.field(mi, "specTypes");
+            spec = st.map(|s| show_sig(w, s)).unwrap_or_default();
+            callee = st.and_then(|s| sig_callee(w, s));
             if let Some(m) = w.field(mi, "def").and_then(|v| v.obj()) {
                 if w.kind(m) == Kind::Method {
                     def = Some(m);
@@ -445,11 +506,16 @@ pub fn code_instances(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<CiRow> {
             _ => None,
         };
         let (wrapper_bytes, _) = sym(&wrap_fn);
+        let clones = |m: &HashMap<u32, u64>| match (m.get(&ci.off), nat) {
+            (Some(&a), Some(n)) => n.func_at(a).map_or(0, |f| n.clone_bytes(f.addr)),
+            _ => 0,
+        };
+        let clone_bytes = clones(&spec_fn) + clones(&wrap_fn);
         let ms = |name| w.field_u64(ci, name).map_or(0.0, |x| f16_to_f32(x as u16) * 1000.0);
         let rettype = w.field(ci, "rettype").map(|v| w.show(v, 3)).unwrap_or_default();
         out.push(CiRow {
-            obj: ci, mi, def, parent: None, root: None, method, module, file, line, spec, owner, status, external_method: ext,
-            inferred_bytes, inferred, invoke, native_bytes, native_symbol, native_addr, wrapper_bytes,
+            obj: ci, mi, def, parent: None, root: None, method, module, file, line, spec, callee, owner, status, external_method: ext,
+            inferred_bytes, inferred, invoke, native_bytes, native_symbol, native_addr, wrapper_bytes, clone_bytes,
             infer_self_ms: ms("time_infer_self"), infer_total_ms: ms("time_infer_total"), rettype,
         });
     }
@@ -571,11 +637,15 @@ pub fn heap_histogram(w: &World, objs: &[ObjEntry], cst: &[ObjEntry], by: Group,
 
 /// `Module.f(argtypes)` for a MethodInstance.
 pub fn mi_label(w: &World, mi: Obj) -> String {
-    let spec = w.field(mi, "specTypes").map(|s| show_sig(w, s)).unwrap_or_default();
+    let st = w.field(mi, "specTypes");
+    let spec = st.map(|s| show_sig(w, s)).unwrap_or_default();
     match w.field(mi, "def").and_then(|v| v.obj()) {
         Some(m) if w.kind(m) == Kind::Method => {
             let r = method_info(w, m);
-            format!("{}.{}{}", r.module, r.name, spec)
+            match st.and_then(|s| sig_callee(w, s)) {
+                Some(c) => format!("{}.(::{c}){}", r.module, spec),
+                None => format!("{}.{}{}", r.module, r.name, spec),
+            }
         }
         Some(m) if w.kind(m) == Kind::Module => format!("<toplevel> {}", w.module_path(m)),
         _ => w.show(Val::Obj(mi), 4),
@@ -600,5 +670,19 @@ pub fn annotate_provenance(w: &World, img: ImgId, cis: &mut [CiRow], p: &crate::
             c.parent = label(par);
             c.root = label(root).or_else(|| Some("<self>".into()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::short_path;
+
+    #[test]
+    fn short_paths_keep_the_package_part() {
+        assert_eq!(short_path("/cache/build/b/usr/share/julia/stdlib/v1.14/Pkg/src/Resolve/graphtype.jl"), "Pkg/src/Resolve/graphtype.jl");
+        assert_eq!(short_path("/home/u/.julia/packages/Foo/AbCd1/src/foo.jl"), "Foo/src/foo.jl");
+        assert_eq!(short_path("/tmp/scripts/run.jl"), "scripts/run.jl");
+        assert_eq!(short_path("array.jl"), "array.jl");
+        assert_eq!(short_path("strings/io.jl"), "strings/io.jl");
     }
 }

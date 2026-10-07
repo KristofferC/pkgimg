@@ -50,9 +50,12 @@ enum Cmd {
         by: CiBy,
         #[arg(long, value_enum, default_value_t = CiSort::Native)]
         sort: CiSort,
-        /// Only code instances whose method name or module contains this string.
+        /// Only code instances whose qualified method name (`Mod.Sub.f`) contains this string.
         #[arg(long)]
         filter: Option<String>,
+        /// Only code instances whose specialization (callee and argument types) contains this string.
+        #[arg(long)]
+        sig: Option<String>,
         /// Only code instances of methods owned by other packages.
         #[arg(long)]
         external: bool,
@@ -77,8 +80,11 @@ enum Cmd {
     Objects {
         file: PathBuf,
         /// Only objects whose type name contains this string (e.g. `Module`, `Base.Dict`).
+        /// Exact names (`String`, `Core.String`) match only that type.
         #[arg(long = "type")]
         ty: Option<String>,
+        #[arg(long, value_enum, default_value_t = ObjSort::Offset)]
+        sort: ObjSort,
     },
     /// Compare two images (e.g. before/after a change): code instances and heap by type.
     Diff {
@@ -144,6 +150,12 @@ enum CiBy {
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
+enum ObjSort {
+    Offset,
+    Size,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq)]
 enum CiSort {
     Native,
     Inferred,
@@ -197,6 +209,18 @@ fn cell(v: &Value) -> String {
     }
 }
 
+/// Shorten `v` to `max` characters: paths lose their start, everything else its end.
+fn truncate(v: &str, max: usize) -> String {
+    let n = v.chars().count();
+    if n <= max {
+        return v.to_string();
+    }
+    if (v.starts_with('/') || v.contains(":\\")) && !v.contains(' ') {
+        return std::iter::once('…').chain(v.chars().skip(n - max + 1)).collect();
+    }
+    v.chars().take(max - 1).chain(['…']).collect()
+}
+
 fn print_table(rows: &[Value], cols: &[(&str, &str)]) {
     let mut widths: Vec<usize> = cols.iter().map(|(_, h)| h.len()).collect();
     let cells: Vec<Vec<String>> = rows
@@ -211,7 +235,7 @@ fn print_table(rows: &[Value], cols: &[(&str, &str)]) {
     let line = |vals: Vec<String>| {
         let mut s = String::new();
         for (i, v) in vals.iter().enumerate() {
-            let v: String = if v.chars().count() > 90 { v.chars().take(89).chain(['…']).collect() } else { v.clone() };
+            let v = truncate(v, 90);
             let numeric = v.parse::<f64>().is_ok();
             if numeric {
                 s.push_str(&format!("{:>w$}  ", v, w = widths[i]));
@@ -272,6 +296,11 @@ fn heap_hist(w: &World, objs: &[ObjEntry], cst: &[ObjEntry], by: HeapBy, section
 }
 
 fn main() -> Result<()> {
+    // Exit quietly when output is piped into `head` and the like.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     let ctx = Ctx { json: cli.json, limit: cli.limit };
     if let Cmd::List { filter, julia, dirs } = &cli.cmd {
@@ -299,7 +328,7 @@ fn main() -> Result<()> {
             let rows = heap_hist(&w, &objs, &cst, by, section);
             ctx.rows("heap", image_id(&w), &rows, &[("bytes", "bytes"), ("count", "count"), ("key", "type")], json!({}));
         }
-        Cmd::Compiled { by, sort, filter, external, .. } => compiled(&ctx, &w, by, sort, filter, external, cli.provenance.as_deref()),
+        Cmd::Compiled { by, sort, filter, sig, external, .. } => compiled(&ctx, &w, by, sort, filter, sig, external, cli.provenance.as_deref()),
         Cmd::Asm { what, .. } => asm(&ctx, &w, &what)?,
         Cmd::Why { what, .. } => why(&ctx, &w, &what, cli.provenance.as_deref())?,
         Cmd::Methods { .. } => {
@@ -313,17 +342,26 @@ fn main() -> Result<()> {
         Cmd::Deps { .. } => deps(&ctx, &w),
         Cmd::Diff { .. } | Cmd::List { .. } => unreachable!(),
         Cmd::Show { offset, cst, .. } => show(&ctx, &w, pkgimg_core::Obj { img: w.target, cst, off: offset }),
-        Cmd::Objects { ty, .. } => {
+        Cmd::Objects { ty, sort, .. } => {
             let (objs, cst) = tables(&w);
+            let typed: Vec<(&ObjEntry, String)> = objs.iter().chain(&cst).map(|e| (e, analysis::type_key(&w, e, false))).collect();
+            let exact = |t: &str, f: &str| t == f || t.rsplit_once('.').is_some_and(|(_, n)| n == f);
+            let mut sel: Vec<&(&ObjEntry, String)> = match &ty {
+                None => typed.iter().collect(),
+                Some(f) if typed.iter().any(|(_, t)| exact(t, f)) => typed.iter().filter(|(_, t)| exact(t, f)).collect(),
+                Some(f) => typed.iter().filter(|(_, t)| t.contains(f.as_str())).collect(),
+            };
+            if sort == ObjSort::Size {
+                sel.sort_by_key(|(e, _)| std::cmp::Reverse(e.size));
+            }
+            let n = ctx.row_count(sel.len());
             let mut rows = vec![];
-            for e in objs.iter().chain(&cst) {
-                let t = analysis::type_key(&w, e, false);
-                if ty.as_ref().is_some_and(|f| !t.contains(f.as_str())) {
-                    continue;
-                }
+            for (i, (e, t)) in sel.iter().enumerate() {
+                // Render only what is printed; the rest just counts.
+                let value = if i < n { json!(w.show(pkgimg_core::Val::Obj(e.obj), 3)) } else { Value::Null };
                 rows.push(json!({
                     "offset": e.obj.off, "section": if e.obj.cst { "const" } else { "objects" },
-                    "size": e.size, "type": t, "value": w.show(pkgimg_core::Val::Obj(e.obj), 3),
+                    "size": e.size, "type": t, "value": value,
                 }));
             }
             ctx.rows("objects", image_id(&w), &rows, &[("section", "section"), ("offset", "offset"), ("size", "size"), ("type", "type"), ("value", "value")], json!({}));
@@ -361,7 +399,8 @@ fn summary(ctx: &Ctx, w: &World) {
     let n_mi = objs.iter().filter(|e| e.ty.is_some() && w.kind(e.obj) == pkgimg_core::world::Kind::MethodInstance).count();
     let unknown = objs.iter().filter(|e| e.ty.is_none()).count();
     let native_ci = cis.iter().filter(|c| c.native_bytes > 0).count();
-    let native_bytes: u64 = cis.iter().map(|c| c.native_bytes + c.wrapper_bytes).sum();
+    let native_bytes: u64 = cis.iter().map(|c| c.native_total()).sum();
+    let clone_bytes: u64 = cis.iter().map(|c| c.clone_bytes).sum();
     let ext_ci = cis.iter().filter(|c| c.external_method).count();
     let dead = cis.iter().filter(|c| c.status == "dead").count();
     let inferred_bytes: u64 = cis.iter().map(|c| c.inferred_bytes).sum();
@@ -384,7 +423,9 @@ fn summary(ctx: &Ctx, w: &World) {
             "srctext_bytes": src_bytes,
             "native_bytes": nat.map(|n| n.file_size),
             "native_text_bytes": nat.map(|n| n.text_size),
+            "native_debug_bytes": nat.map(|n| n.debug_size()),
         },
+        "cpu_target": nat.and_then(|n| n.cpu_target.as_ref()),
         "heap_sections": s,
         "counts": {
             "objects": objs.len(),
@@ -397,12 +438,14 @@ fn summary(ctx: &Ctx, w: &World) {
             "code_instances_for_external_methods": ext_ci,
             "dead_code_instances": dead,
             "native_functions": nat.map(|n| n.fvars.len()),
+            "native_clones": nat.map(|n| n.clones.values().map(|c| c.0 as u64).sum::<u64>()),
             "symbols": im.heap.symbols.len(),
             "required_modules": h.pkg.as_ref().map(|p| p.required_modules.len()),
             "unresolved_dependencies": w.missing.iter().map(|m| &m.name).collect::<Vec<_>>(),
         },
         "bytes": {
             "native_code_for_code_instances": native_bytes,
+            "native_clones_for_code_instances": clone_bytes,
             "compressed_inferred_ir": inferred_bytes,
         },
         "total_rows": top.len(),
@@ -422,7 +465,10 @@ fn summary(ctx: &Ctx, w: &World) {
     println!("files");
     println!("  .ji {:>12}   heap {:>12}   embedded sources {}", kb(ji_len), kb(im.heap_stored_size as u64), kb(src_bytes as u64));
     if let Some(n) = nat {
-        println!("  native {:>9}   .text {}", kb(n.file_size), kb(n.text_size));
+        println!("  native {:>9}   .text {}   debug info {}", kb(n.file_size), kb(n.text_size), kb(n.debug_size()));
+        if let Some(t) = &n.cpu_target {
+            println!("  cpu targets: {t}");
+        }
     }
     println!("heap sections");
     for (k, b) in [("objects", s.objects), ("const_data", s.const_data), ("symbols", s.symbols), ("relocs", s.relocs), ("gvar_record", s.gvar_record), ("fptr_record", s.fptr_record)] {
@@ -432,6 +478,9 @@ fn summary(ctx: &Ctx, w: &World) {
     println!("  objects {}  const objects {}  methods {}  method instances {}", objs.len(), v["counts"]["const_objects"], n_methods, n_mi);
     println!("  code instances {}  (with native code {}, for external methods {}, dead {})", cis.len(), native_ci, ext_ci, dead);
     println!("  native code for code instances {}  compressed inferred IR {}", kb(native_bytes), kb(inferred_bytes));
+    if clone_bytes > 0 {
+        println!("  plus {} in clones for other CPU targets (sizes elsewhere count one target)", kb(clone_bytes));
+    }
     if unknown > 0 {
         println!("  objects with unresolved type: {unknown}");
     }
@@ -448,6 +497,7 @@ struct CiGroup {
     key: String,
     code_instances: u64,
     native_bytes: u64,
+    clone_bytes: u64,
     inferred_bytes: u64,
     infer_self_ms: f32,
 }
@@ -465,23 +515,32 @@ fn load_cis(w: &World, objs: &[ObjEntry], prov: Option<&std::path::Path>, need: 
     rows
 }
 
-fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>, external: bool, prov: Option<&std::path::Path>) {
+#[allow(clippy::too_many_arguments)]
+fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>, sig: Option<String>, external: bool, prov: Option<&std::path::Path>) {
     let (objs, _) = tables(w);
     let mut rows: Vec<CiRow> = load_cis(w, &objs, prov, matches!(by, CiBy::Root | CiBy::Parent));
     if let Some(f) = &filter {
-        rows.retain(|r| r.method.contains(f.as_str()) || r.module.contains(f.as_str()));
+        rows.retain(|r| format!("{}.{}", r.module, r.method).contains(f.as_str()));
+    }
+    if let Some(f) = &sig {
+        rows.retain(|r| r.spec.contains(f.as_str()) || r.callee.as_ref().is_some_and(|c| c.contains(f.as_str())));
     }
     if external {
         rows.retain(|r| r.external_method);
     }
-    let total_native: u64 = rows.iter().map(|r| r.native_bytes + r.wrapper_bytes).sum();
+    let total_native: u64 = rows.iter().map(|r| r.native_total()).sum();
     let extra = json!({"totals": {"code_instances": rows.len(), "native_bytes": total_native,
+        "clone_bytes": rows.iter().map(|r| r.clone_bytes).sum::<u64>(),
         "inferred_bytes": rows.iter().map(|r| r.inferred_bytes).sum::<u64>()}});
     if by != CiBy::None {
+        let labels = method_labels(w, &rows);
         let mut m: std::collections::HashMap<String, CiGroup> = Default::default();
         for r in &rows {
             let key = match by {
-                CiBy::Method => format!("{}.{} @ {}:{}", r.module, r.method, r.file, r.line),
+                CiBy::Method => match r.def {
+                    Some(d) => labels[&d].clone(),
+                    None => format!("{}.{}", r.module, r.method),
+                },
                 CiBy::File => r.file.clone(),
                 CiBy::Module => r.module.clone(),
                 CiBy::Root => r.root.clone().unwrap_or_else(|| "<no provenance record>".into()),
@@ -490,7 +549,8 @@ fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>
             };
             let g = m.entry(key.clone()).or_insert_with(|| CiGroup { key, ..Default::default() });
             g.code_instances += 1;
-            g.native_bytes += r.native_bytes + r.wrapper_bytes;
+            g.native_bytes += r.native_total();
+            g.clone_bytes += r.clone_bytes;
             g.inferred_bytes += r.inferred_bytes;
             g.infer_self_ms += r.infer_self_ms;
         }
@@ -505,17 +565,39 @@ fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>
         return;
     }
     rows.sort_by(|a, b| match sort {
-        CiSort::Native => (b.native_bytes + b.wrapper_bytes).cmp(&(a.native_bytes + a.wrapper_bytes)),
+        CiSort::Native => b.native_total().cmp(&a.native_total()),
         CiSort::Inferred => b.inferred_bytes.cmp(&a.inferred_bytes),
         CiSort::InferTime => b.infer_self_ms.total_cmp(&a.infer_self_ms),
         CiSort::Name => (&a.module, &a.method).cmp(&(&b.module, &b.method)),
     });
     let shown: Vec<Value> = rows.iter().map(|r| {
         let mut value = located_row(r, r.obj);
-        value["func"] = json!(format!("{}.{}{}", r.module, r.method, r.spec));
+        value["func"] = json!(r.label());
+        value["native_total_bytes"] = json!(r.native_total());
         value
     }).collect();
-    ctx.rows("compiled", image_id(w), &shown, &[("native_bytes", "native"), ("inferred_bytes", "inferred"), ("infer_self_ms", "infer ms"), ("status", "status"), ("invoke", "invoke"), ("func", "specialization")], extra);
+    ctx.rows("compiled", image_id(w), &shown, &[("native_total_bytes", "native"), ("inferred_bytes", "inferred"), ("infer_self_ms", "infer ms"), ("status", "status"), ("invoke", "invoke"), ("func", "specialization")], extra);
+}
+
+/// `Mod.f @ Pkg/src/file.jl:line` per method, plus the method signature where two
+/// methods would otherwise share a label.
+fn method_labels(w: &World, rows: &[CiRow]) -> std::collections::HashMap<pkgimg_core::Obj, String> {
+    let mut out: std::collections::HashMap<pkgimg_core::Obj, String> = Default::default();
+    for r in rows {
+        if let Some(d) = r.def {
+            out.entry(d).or_insert_with(|| format!("{}.{} @ {}:{}", r.module, r.method, analysis::short_path(&r.file), r.line));
+        }
+    }
+    let mut count: std::collections::HashMap<String, usize> = Default::default();
+    for l in out.values() {
+        *count.entry(l.clone()).or_default() += 1;
+    }
+    for (d, l) in out.iter_mut() {
+        if count[l.as_str()] > 1 {
+            *l = format!("{l} {}", analysis::method_info(w, *d).sig);
+        }
+    }
+    out
 }
 
 fn insights(ctx: &Ctx, w: &World, prov: Option<&std::path::Path>) {
@@ -589,7 +671,7 @@ fn degensym(s: &str) -> String {
 
 fn ci_key(r: &CiRow) -> String {
     let owner = if r.owner == "nothing" { String::new() } else { format!(" [owner {}]", r.owner) };
-    degensym(&format!("{}.{}{}{}", r.module, r.method, r.spec, owner))
+    degensym(&format!("{}{}", r.label(), owner))
 }
 
 fn method_key(r: &CiRow) -> String {
@@ -626,13 +708,13 @@ fn diff(ctx: &Ctx, a: &World, b: &World) -> Result<()> {
     let mut ma: std::collections::HashMap<String, (u64, u64)> = Default::default();
     for r in &ca {
         let e = ma.entry(ci_key(r)).or_default();
-        e.0 += r.native_bytes + r.wrapper_bytes;
+        e.0 += r.native_total();
         e.1 += r.inferred_bytes;
     }
     let mut mb: std::collections::HashMap<String, (u64, u64)> = Default::default();
     for r in &cb {
         let e = mb.entry(ci_key(r)).or_default();
-        e.0 += r.native_bytes + r.wrapper_bytes;
+        e.0 += r.native_total();
         e.1 += r.inferred_bytes;
     }
     let mut cis = vec![];
@@ -660,7 +742,7 @@ fn diff(ctx: &Ctx, a: &World, b: &World) -> Result<()> {
             let k = method_key(r);
             let e = md.entry(k.clone()).or_insert_with(|| MethodDelta { method: k, ..Default::default() });
             if sign < 0 { e.a_code_instances += 1 } else { e.b_code_instances += 1 }
-            e.delta_native_bytes += sign * (r.native_bytes + r.wrapper_bytes) as i64;
+            e.delta_native_bytes += sign * r.native_total() as i64;
         }
     }
     let mut methods: Vec<MethodDelta> = md.into_values().map(|mut m| { m.delta_code_instances = m.b_code_instances - m.a_code_instances; m })
@@ -678,7 +760,7 @@ fn diff(ctx: &Ctx, a: &World, b: &World) -> Result<()> {
     }
     let mut types: Vec<TypeDelta> = types.into_values().filter(|t| t.a_bytes != t.b_bytes).map(|mut t| { t.delta_bytes = t.b_bytes as i64 - t.a_bytes as i64; t }).collect();
     types.sort_by(|a, b| b.delta_bytes.abs().cmp(&a.delta_bytes.abs()).then_with(|| a.key.cmp(&b.key)));
-    let tot = |c: &[CiRow]| (c.len(), c.iter().map(|r| r.native_bytes + r.wrapper_bytes).sum::<u64>(), c.iter().map(|r| r.inferred_bytes).sum::<u64>());
+    let tot = |c: &[CiRow]| (c.len(), c.iter().map(|r| r.native_total()).sum::<u64>(), c.iter().map(|r| r.inferred_bytes).sum::<u64>());
     let (ta, tb) = (tot(&ca), tot(&cb));
     let heap = |w: &World| w.target().heap.data.len() as i64;
     let summary = json!({
@@ -811,8 +893,8 @@ fn why(ctx: &Ctx, w: &World, what: &str, prov: Option<&std::path::Path>) -> Resu
         Ok(off) => rows.iter().find(|r| r.obj.off == off),
         Err(_) => rows
             .iter()
-            .filter(|r| format!("{}.{}{}", r.module, r.method, r.spec).contains(what))
-            .max_by_key(|r| r.native_bytes + r.wrapper_bytes + r.inferred_bytes),
+            .filter(|r| r.label().contains(what))
+            .max_by_key(|r| r.native_total() + r.inferred_bytes),
     };
     let Some(start) = pick else { anyhow::bail!("no code instance matches {what:?}") };
     // Follow parents: parent label -> code instance with that MethodInstance label.
@@ -826,8 +908,8 @@ fn why(ctx: &Ctx, w: &World, what: &str, prov: Option<&std::path::Path>) -> Resu
             break;
         }
         chain.push(json!({
-            "specialization": format!("{}.{}{}", r.module, r.method, r.spec),
-            "offset": r.obj.off, "native_bytes": r.native_bytes + r.wrapper_bytes,
+            "specialization": r.label(),
+            "offset": r.obj.off, "native_bytes": r.native_total(),
             "inferred_bytes": r.inferred_bytes, "file": r.file, "line": r.line,
         }));
         cur = r.parent.as_ref().and_then(|p| by_label.get(p).copied());
@@ -855,7 +937,7 @@ fn why(ctx: &Ctx, w: &World, what: &str, prov: Option<&std::path::Path>) -> Resu
 /// this reader supports, among all discovered depots and Julia installations.
 fn resolve_target(p: &std::path::Path, depots: &[PathBuf]) -> Result<PathBuf> {
     use pkgimg_core::discover;
-    if p.exists() || p.components().count() > 1 {
+    if p.is_file() || p.components().count() > 1 {
         return Ok(p.to_path_buf());
     }
     let name = p.to_string_lossy();
@@ -916,8 +998,8 @@ fn pick_ci<'a>(w: &World, rows: &'a [CiRow], what: &str) -> Option<&'a CiRow> {
         Ok(off) => rows.iter().find(|r| r.obj.off == off),
         Err(_) => rows
             .iter()
-            .filter(|r| format!("{}.{}{}", r.module, r.method, r.spec).contains(what))
-            .max_by_key(|r| r.native_bytes + r.wrapper_bytes + r.inferred_bytes),
+            .filter(|r| r.label().contains(what))
+            .max_by_key(|r| r.native_total() + r.inferred_bytes),
     }
 }
 
@@ -926,17 +1008,17 @@ fn asm(ctx: &Ctx, w: &World, what: &str) -> Result<()> {
     let rows = analysis::code_instances(w, w.target, &objs);
     let r = pick_ci(w, &rows, what).ok_or_else(|| anyhow::anyhow!("no code instance matches {what:?}"))?;
     let (Some(addr), Some(buf)) = (r.native_addr, w.target().native_bytes.as_ref()) else {
-        anyhow::bail!("{}.{}{} has no native code in this image", r.module, r.method, r.spec);
+        anyhow::bail!("{} has no native code in this image", r.label());
     };
     let lines = pkgimg_core::native::disassemble(buf, addr, r.native_bytes)?;
     if ctx.json {
-        let v = json!({"schema": "pkgimg/1", "command": "asm", "specialization": format!("{}.{}{}", r.module, r.method, r.spec),
+        let v = json!({"schema": "pkgimg/1", "command": "asm", "specialization": r.label(),
             "symbol": r.native_symbol, "bytes": r.native_bytes,
             "instructions": lines.iter().map(|(a, t)| json!({"address": format!("{a:#x}"), "text": t})).collect::<Vec<_>>()});
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(());
     }
-    println!("; {}.{}{}  ({}, {} bytes)", r.module, r.method, r.spec, r.native_symbol.as_deref().unwrap_or("?"), r.native_bytes);
+    println!("; {}  ({}, {} bytes)", r.label(), r.native_symbol.as_deref().unwrap_or("?"), r.native_bytes);
     for (a, t) in lines {
         println!("{a:8x}  {t}");
     }
@@ -952,6 +1034,17 @@ mod tests {
         let obj = pkgimg_core::Obj { img: 0, off: 128, cst: true };
         let value = located_row(&json!({"method": "f"}), obj);
         assert_eq!(value, json!({"method": "f", "offset": 128, "const": true}));
+    }
+
+    #[test]
+    fn long_paths_lose_their_start() {
+        let p = format!("/cache/build/{}/stdlib/v1.14/Pkg/src/Operations.jl", "x".repeat(80));
+        let t = truncate(&p, 40);
+        assert_eq!(t.chars().count(), 40);
+        assert!(t.starts_with('…') && t.ends_with("Pkg/src/Operations.jl"));
+        let sig = format!("Base.f({})", "Int64, ".repeat(20));
+        assert!(truncate(&sig, 40).starts_with("Base.f(") && truncate(&sig, 40).ends_with('…'));
+        assert_eq!(truncate("short", 40), "short");
     }
 
     #[test]
