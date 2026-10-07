@@ -403,6 +403,8 @@ fn summary(ctx: &Ctx, w: &World) {
     let clone_bytes: u64 = cis.iter().map(|c| c.clone_bytes).sum();
     let ext_ci = cis.iter().filter(|c| c.external_method).count();
     let dead = cis.iter().filter(|c| c.status == "dead").count();
+    let cw: Vec<&CiRow> = cis.iter().filter(|c| c.status == "compiler-world").collect();
+    let cw_bytes: u64 = cw.iter().map(|c| c.native_total()).sum();
     let inferred_bytes: u64 = cis.iter().map(|c| c.inferred_bytes).sum();
     let top = heap_hist(w, &objs, &cst, HeapBy::Type, Section::All);
     let h = &im.header;
@@ -426,6 +428,7 @@ fn summary(ctx: &Ctx, w: &World) {
             "native_debug_bytes": nat.map(|n| n.debug_size()),
         },
         "cpu_target": nat.and_then(|n| n.cpu_target.as_ref()),
+        "worlds": im.heap.worlds.map(|wd| json!({"world": wd.world, "typeinf_world": wd.typeinf_world})),
         "heap_sections": s,
         "counts": {
             "objects": objs.len(),
@@ -437,6 +440,7 @@ fn summary(ctx: &Ctx, w: &World) {
             "code_instances_with_native_code": native_ci,
             "code_instances_for_external_methods": ext_ci,
             "dead_code_instances": dead,
+            "compiler_world_code_instances": cw.len(),
             "native_functions": nat.map(|n| n.fvars.len()),
             "native_clones": nat.map(|n| n.clones.values().map(|c| c.0 as u64).sum::<u64>()),
             "symbols": im.heap.symbols.len(),
@@ -446,6 +450,7 @@ fn summary(ctx: &Ctx, w: &World) {
         "bytes": {
             "native_code_for_code_instances": native_bytes,
             "native_clones_for_code_instances": clone_bytes,
+            "native_code_for_compiler_world": cw_bytes,
             "compressed_inferred_ir": inferred_bytes,
         },
         "total_rows": top.len(),
@@ -478,6 +483,10 @@ fn summary(ctx: &Ctx, w: &World) {
     println!("  objects {}  const objects {}  methods {}  method instances {}", objs.len(), v["counts"]["const_objects"], n_methods, n_mi);
     println!("  code instances {}  (with native code {}, for external methods {}, dead {})", cis.len(), native_ci, ext_ci, dead);
     println!("  native code for code instances {}  compressed inferred IR {}", kb(native_bytes), kb(inferred_bytes));
+    if let Some(wd) = im.heap.worlds {
+        println!("  world {}, compiler runs in world {}: {} code instances ({}) kept for that world only",
+            wd.world, wd.typeinf_world, cw.len(), kb(cw_bytes));
+    }
     if clone_bytes > 0 {
         println!("  plus {} in clones for other CPU targets (sizes elsewhere count one target)", kb(clone_bytes));
     }

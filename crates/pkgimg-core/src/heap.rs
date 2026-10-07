@@ -90,6 +90,24 @@ pub struct Roots {
     pub method_roots_list: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Worlds {
+    pub world: u64,
+    pub typeinf_world: u64,
+}
+
+/// The worlds at the end of a system image stream: `..., gs_ctr::u32, world::u64,
+/// typeinf_world::u64`, then four link-id lists (empty in a system image) and
+/// `external_fns_begin::u32`.
+fn sys_worlds(buf: &[u8]) -> Option<Worlds> {
+    let t = buf.get(buf.len().checked_sub(36)?..)?;
+    let u64_at = |i: usize| u64::from_le_bytes(t[i..i + 8].try_into().unwrap());
+    let (world, typeinf_world) = (u64_at(0), u64_at(8));
+    let empty_lists = t[16..32].iter().all(|&b| b == 0);
+    (empty_lists && 0 < typeinf_world && typeinf_world <= world && world < 1 << 48)
+        .then_some(Worlds { world, typeinf_world })
+}
+
 pub struct Heap {
     /// Uncompressed heap bytes, starting at the `.ji` `datastartpos`.
     pub data: Blob,
@@ -118,6 +136,8 @@ pub struct Heap {
     pub link_ids_gvars: Vec<u32>,
     pub link_ids_external_fnvars: Vec<u32>,
     pub external_fns_begin: u32,
+    /// System images: the world counter when saved and the world the compiler runs in.
+    pub worlds: Option<Worlds>,
     /// `ExternalLinkage` words: position -> depsidx (from the link-id tables).
     pub ext_link: HashMap<u32, u32>,
 }
@@ -209,6 +229,7 @@ impl Heap {
             external_fns_begin = c.u32()?;
         }
         let [link_gctags, link_relocs, link_ids_gvars, link_ids_external_fnvars] = link;
+        let worlds = if incremental { None } else { sys_worlds(buf) };
 
         let sys = &buf[sys_base..sys_base + sys_len];
         let mut ext_link = HashMap::new();
@@ -238,7 +259,7 @@ impl Heap {
             data, incremental, sys_base, sys_len, const_base, const_len, sizes, symbols,
             gctags, relocs, memowner, memref, uniquing_types, uniquing_objs, fixup_types,
             fixup_objs, gvar_record, fptr_record, roots, link_ids_gvars,
-            link_ids_external_fnvars, external_fns_begin, ext_link,
+            link_ids_external_fnvars, external_fns_begin, worlds, ext_link,
         })
     }
 
@@ -250,5 +271,24 @@ impl Heap {
     #[inline]
     pub fn cdata(&self) -> &[u8] {
         &self.data[self.const_base..self.const_base + self.const_len]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_image_worlds_are_read_from_the_tail() {
+        let mut b = vec![0xab; 40]; // roots, gs_ctr
+        b.extend(43207u64.to_le_bytes());
+        b.extend(12074u64.to_le_bytes());
+        b.extend([0; 16]); // four empty link-id lists
+        b.extend(7u32.to_le_bytes()); // external_fns_begin
+        assert_eq!(sys_worlds(&b), Some(Worlds { world: 43207, typeinf_world: 12074 }));
+        // A non-empty link-id list means the layout is not what we expect.
+        let n = b.len();
+        b[n - 8] = 1;
+        assert_eq!(sys_worlds(&b), None);
     }
 }

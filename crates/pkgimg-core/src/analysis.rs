@@ -372,8 +372,12 @@ pub struct CiRow {
     pub callee: Option<String>,
     /// `nothing` for native compilation; otherwise the abstract interpreter's cache owner.
     pub owner: String,
-    /// "live" (valid, revalidated on load), "dead" (invalidated before saving), or raw worlds.
+    /// "live" (valid now; in a package image, revalidated on load), "dead" (invalidated before
+    /// saving), "compiler-world" (a system image's copy valid only in the world the compiler
+    /// runs in), "stale" (valid in neither), or the raw world range.
     pub status: String,
+    pub min_world: u64,
+    pub max_world: u64,
     pub external_method: bool,
     pub inferred_bytes: u64,
     pub inferred: String,
@@ -414,6 +418,7 @@ impl CiRow {
 
 pub fn code_instances(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<CiRow> {
     let image = w.img(img);
+    let worlds = image.heap.worlds;
     // fvar index -> (ci offset, is wrapper)
     let mut spec_fn: HashMap<u32, u64> = HashMap::new();
     let mut wrap_fn: HashMap<u32, u64> = HashMap::new();
@@ -466,10 +471,13 @@ pub fn code_instances(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<CiRow> {
         let owner = w.field(ci, "owner").map(|v| w.show(v, 3)).unwrap_or_default();
         let minw = w.field_u64(ci, "min_world").unwrap_or(0);
         let maxw = w.field_u64(ci, "max_world").unwrap_or(0);
-        let status = match (minw, maxw) {
-            (u64::MAX, 1) => "live".to_string(),
-            (1, 0) => "dead".to_string(),
-            (a, b) => format!("{a}..{b}"),
+        let status = match (minw, maxw, worlds) {
+            (u64::MAX, 1, _) => "live".to_string(),
+            (1, 0, _) => "dead".to_string(),
+            (_, u64::MAX, Some(_)) => "live".to_string(),
+            (a, b, Some(wd)) if a <= wd.typeinf_world && wd.typeinf_world <= b => "compiler-world".to_string(),
+            (_, _, Some(_)) => "stale".to_string(),
+            (a, b, None) => format!("{a}..{b}"),
         };
         let inf = w.field(ci, "inferred").unwrap_or(Val::Null);
         let (inferred, inferred_bytes) = match inf {
@@ -514,7 +522,8 @@ pub fn code_instances(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<CiRow> {
         let ms = |name| w.field_u64(ci, name).map_or(0.0, |x| f16_to_f32(x as u16) * 1000.0);
         let rettype = w.field(ci, "rettype").map(|v| w.show(v, 3)).unwrap_or_default();
         out.push(CiRow {
-            obj: ci, mi, def, parent: None, root: None, method, module, file, line, spec, callee, owner, status, external_method: ext,
+            obj: ci, mi, def, parent: None, root: None, method, module, file, line, spec, callee, owner, status,
+            min_world: minw, max_world: maxw, external_method: ext,
             inferred_bytes, inferred, invoke, native_bytes, native_symbol, native_addr, wrapper_bytes, clone_bytes,
             infer_self_ms: ms("time_infer_self"), infer_total_ms: ms("time_infer_total"), rettype,
         });

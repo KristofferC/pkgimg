@@ -26,7 +26,8 @@ pkgimg compiled  <file.ji> [--by method|file|module|root|parent] [--sort native|
                            [--filter STR] [--sig STR] [--external]
 pkgimg methods   <file.ji>
 pkgimg insights  <file.ji>                   unusual parts: functions with very many methods, @eval
-                                             loops, piracy, many specializations, invalidated code
+                                             loops, piracy, many specializations, invalidated code,
+                                             code a system image keeps for the compiler's world
 pkgimg objects   <file.ji> [--type STR] [--sort offset|size]
 pkgimg show      <file.ji> <offset> [--const]  decode one object: fields, elements, referrers
 pkgimg why       <file.ji> <offset|substring>  inference chain of a code instance (needs provenance)
@@ -59,7 +60,8 @@ be passed to `show` (`--const` when true) or used to select a code instance with
 `compiled --filter` matches the qualified method name (`Pkg.Resolve.Graph`), `--sig` the
 argument and callee types. When the callee type tells specializations apart (closures with
 captured types, `TypeEgal{T}` constructors), rows show `Mod.(::Callee)(args)` and carry it as
-`callee`. Native sizes count one CPU target; `clone_bytes` and `summary` give the clones
+`callee`. In a system image, `status` is `compiler-world` for code kept only for the world the
+compiler runs in (`summary` gives both worlds). Native sizes count one CPU target; `clone_bytes` and `summary` give the clones
 compiled for the other targets of a multiversioned image.
 `methods` rows also give the extended function (`func`), whether another module owns it
 (`func_external`), possible piracy (`pirate`) and whether it is a keyword method

@@ -119,7 +119,8 @@ fn many_methods(methods: &[MethodRow]) -> Option<Insight> {
 /// Many methods defined at one source line: code generation loops.
 fn generated_methods(methods: &[MethodRow]) -> Option<Insight> {
     let mut by: HashMap<(&str, i64), (usize, Vec<&str>)> = HashMap::new();
-    for m in methods.iter().filter(|m| !m.external) {
+    // Builtins have no source location.
+    for m in methods.iter().filter(|m| !m.external && !m.file.is_empty() && m.line > 0) {
         let e = by.entry((&m.file, m.line)).or_default();
         e.0 += 1;
         if e.1.len() < 4 && !e.1.contains(&m.name.as_str()) {
@@ -281,6 +282,89 @@ fn inference_time(w: &World, cis: &[CiRow]) -> Option<Insight> {
     })
 }
 
+/// The definition that ended world `w`: a method added or deleted in `w + 1`, or a binding
+/// changed then.
+fn ended_by(w: &World, objs: &[ObjEntry], end: u64) -> Option<String> {
+    use crate::world::Kind;
+    let next = end.checked_add(1)?;
+    let mut found = vec![];
+    for e in objs.iter().filter(|e| e.ty.is_some()) {
+        let o = e.obj;
+        match w.kind(o) {
+            Kind::Method if w.field_u64(o, "primary_world") == Some(next) => found.push(format!("{} defined", w.show(crate::Val::Obj(o), 3))),
+            Kind::Binding => {
+                let mut p = w.field(o, "partitions").and_then(|v| v.obj());
+                for _ in 0..64 {
+                    let Some(bp) = p.filter(|b| w.type_info(*b).is_some_and(|t| t.name == "BindingPartition")) else { break };
+                    if w.field_u64(bp, "min_world") == Some(next) {
+                        found.push(format!("{} changed", w.show(crate::Val::Obj(o), 3).trim_start_matches("Binding ")));
+                        break;
+                    }
+                    p = w.field(bp, "next").and_then(|v| v.obj());
+                }
+            }
+            _ if w.type_info(o).is_some_and(|t| t.name == "TypeMapEntry") && w.field_u64(o, "max_world") == Some(end) => {
+                if let Some(m) = w.field(o, "func").and_then(|v| v.obj()).filter(|m| w.kind(*m) == Kind::Method) {
+                    found.push(format!("{} replaced", w.show(crate::Val::Obj(m), 3)));
+                }
+            }
+            _ => {}
+        }
+        if found.len() >= 2 {
+            break;
+        }
+    }
+    (!found.is_empty()).then(|| found.join("; "))
+}
+
+/// System images: code kept twice, once for the world the compiler runs in.
+fn compiler_world(w: &World, objs: &[ObjEntry], cis: &[CiRow]) -> Option<Insight> {
+    let worlds = w.target().heap.worlds?;
+    let rows: Vec<&CiRow> = cis.iter().filter(|c| c.status == "compiler-world").collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let bytes = |c: &CiRow| c.native_total() + c.clone_bytes;
+    let total: u64 = rows.iter().map(|c| bytes(c)).sum();
+    let all: u64 = cis.iter().map(bytes).sum();
+    let mut by: HashMap<u64, (usize, u64)> = HashMap::new();
+    for c in &rows {
+        let e = by.entry(c.max_world).or_default();
+        e.0 += 1;
+        e.1 += bytes(c);
+    }
+    let (mut items, total_items) = top(by.into_iter().collect(), |r| r.1.1 as f64, |r, wt| Item {
+        label: format!("ended at world {}", r.0),
+        value: format!("{} · {}", plural(r.1.0, "CI"), human(r.1.1)),
+        weight: wt,
+        link: Link::Object { obj: rows[0].obj, offset: rows[0].obj.off, cst: false },
+    });
+    // Name the definitions only for the items shown: it scans all objects.
+    for it in items.iter_mut() {
+        let end: u64 = it.label.rsplit(' ').next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        if let Some(d) = ended_by(w, objs, end) {
+            it.label = format!("{} by {d}", it.label);
+        }
+        if let Some(c) = rows.iter().filter(|c| c.max_world == end).max_by_key(|c| bytes(c)) {
+            it.link = Link::object(c.obj);
+        }
+    }
+    Some(Insight {
+        kind: "compiler-world",
+        severity: if total >= 4 << 20 { Severity::Notable } else { Severity::Info },
+        title: "Code kept for the compiler's world".into(),
+        summary: format!(
+            "{} ({}, {:.0}% of native code including CPU-target clones) are valid only in world {}, where the compiler runs",
+            plural(rows.len(), "code instance"), human(total), 100.0 * total as f64 / all.max(1) as f64, worlds.typeinf_world,
+        ),
+        detail: "The compiler runs in the world in which it was bootstrapped. Code it uses that later \
+                 definitions replaced is saved twice: once for that world and once for everything else. \
+                 Each group lists the definition that ended the world range.",
+        items,
+        total_items,
+    })
+}
+
 fn dead_code(cis: &[CiRow]) -> Option<Insight> {
     let dead: Vec<&CiRow> = cis.iter().filter(|c| c.status == "dead").collect();
     if dead.is_empty() {
@@ -340,7 +424,9 @@ pub fn insights(w: &World, objs: &[ObjEntry], cst: &[ObjEntry], methods: &[Metho
         piracy(w, methods),
         dead_code(cis),
         native_concentration(w, cis),
-        inference_time(w, cis),
+        // Inference in a system image includes the compiler inferring itself while interpreted.
+        if w.target().header.pkg.is_none() { None } else { inference_time(w, cis) },
+        compiler_world(w, objs, cis),
         large_objects(w, objs, cst),
     ]
     .into_iter()
