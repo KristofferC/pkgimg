@@ -50,8 +50,78 @@ impl NativeInfo {
 
 struct Mem<'a> {
     file: &'a object::File<'a>,
-    /// Pointer slots fixed up by `R_*_RELATIVE` dynamic relocations: slot -> target.
+    /// Pointer slots fixed up by `R_*_RELATIVE` dynamic relocations or Mach-O chained
+    /// rebases: slot -> target.
     relative: HashMap<u64, u64>,
+}
+
+fn le16(d: &[u8], o: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(d.get(o..o + 2)?.try_into().ok()?))
+}
+fn le32(d: &[u8], o: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(d.get(o..o + 4)?.try_into().ok()?))
+}
+fn le64(d: &[u8], o: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(d.get(o..o + 8)?.try_into().ok()?))
+}
+
+/// Rebases from `LC_DYLD_CHAINED_FIXUPS` (`DYLD_CHAINED_PTR_64` and `_64_OFFSET`, as
+/// used by arm64 and x86-64 macOS): pointer slot -> target address. Binds are skipped.
+fn chained_rebases(file: &object::File, out: &mut HashMap<u64, u64>) -> Option<()> {
+    use object::macho;
+    let object::File::MachO64(f) = file else { return None };
+    let e = f.endian();
+    let buf = f.data();
+    // (vmaddr, fileoff, filesize) in load command order, as indexed by the fixups.
+    let mut segs = vec![];
+    let mut fixups = None;
+    let mut cmds = f.macho_load_commands().ok()?;
+    while let Ok(Some(cmd)) = cmds.next() {
+        if let Ok(Some((seg, _))) = cmd.segment_64() {
+            segs.push((seg.vmaddr.get(e), seg.fileoff.get(e), seg.filesize.get(e)));
+        } else if cmd.cmd() == macho::LC_DYLD_CHAINED_FIXUPS {
+            let c = cmd.data::<macho::LinkeditDataCommand<object::Endianness>>().ok()?;
+            fixups = buf.get(c.dataoff.get(e) as usize..)?.get(..c.datasize.get(e) as usize);
+        }
+    }
+    let d = fixups?;
+    // Image base: the segment that maps the Mach-O header.
+    let base = segs.iter().find(|s| s.1 == 0 && s.2 > 0)?.0;
+    let starts = le32(d, 4)? as usize;
+    for (i, &(vmaddr, fileoff, _)) in segs.iter().enumerate().take(le32(d, starts)? as usize) {
+        let info = le32(d, starts + 4 + 4 * i)? as usize;
+        if info == 0 {
+            continue;
+        }
+        let ss = starts + info;
+        let page_size = le16(d, ss + 4)? as u64;
+        let format = le16(d, ss + 6)?;
+        let offset_based = match format {
+            2 => false, // DYLD_CHAINED_PTR_64: target is a vmaddr
+            6 => true,  // DYLD_CHAINED_PTR_64_OFFSET: target is an offset from the image base
+            _ => continue,
+        };
+        for page in 0..le16(d, ss + 20)? as u64 {
+            let start = le16(d, ss + 22 + 2 * page as usize)?;
+            if start == macho::DYLD_CHAINED_PTR_START_NONE {
+                continue;
+            }
+            let mut off = page * page_size + start as u64;
+            loop {
+                let raw = le64(buf, (fileoff + off) as usize)?;
+                if raw >> 63 == 0 {
+                    let target = (raw & 0xF_FFFF_FFFF) | ((raw >> 36) & 0xFF) << 56;
+                    out.insert(vmaddr + off, if offset_based { base + target } else { target });
+                }
+                let next = (raw >> 51) & 0xFFF;
+                if next == 0 {
+                    break;
+                }
+                off += 4 * next;
+            }
+        }
+    }
+    Some(())
 }
 
 impl<'a> Mem<'a> {
@@ -64,6 +134,7 @@ impl<'a> Mem<'a> {
                 }
             }
         }
+        chained_rebases(file, &mut relative);
         Mem { file, relative }
     }
 
@@ -164,13 +235,29 @@ pub fn parse(buf: &[u8]) -> Result<NativeInfo> {
         }
         info.sections.push((name, s.size()));
     }
+    // Mach-O symbols carry no size; each function then extends to the next one.
+    let macho = file.format() == object::BinaryFormat::MachO;
     let mut funcs: Vec<NativeFunc> = file
         .symbols()
-        .filter(|s| s.kind() == SymbolKind::Text && s.size() > 0)
+        .filter(|s| s.kind() == SymbolKind::Text && (s.size() > 0 || macho))
         .map(|s| NativeFunc { addr: s.address(), size: s.size(), name: s.name().unwrap_or("").to_string() })
         .collect();
     funcs.sort_by_key(|f| f.addr);
     funcs.dedup_by_key(|f| f.addr);
+    if macho {
+        let text: Vec<(u64, u64)> = file
+            .sections()
+            .filter(|s| s.kind() == object::SectionKind::Text)
+            .map(|s| (s.address(), s.address() + s.size()))
+            .collect();
+        for i in 0..funcs.len() {
+            let addr = funcs[i].addr;
+            let Some(&(_, end)) = text.iter().find(|&&(a, e)| addr >= a && addr < e) else { continue };
+            let next = funcs.get(i + 1).map_or(end, |f| f.addr.min(end));
+            funcs[i].size = next - addr;
+        }
+        funcs.retain(|f| f.size > 0);
+    }
     let by_name: HashMap<&str, u64> = funcs.iter().map(|f| (f.name.as_str(), f.addr)).collect();
     for f in &funcs {
         let Some((base, n)) = f.name.rsplit_once('.') else { continue };
