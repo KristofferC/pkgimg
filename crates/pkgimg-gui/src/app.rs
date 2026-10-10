@@ -1275,7 +1275,14 @@ impl Doc {
                     row.set_selected(sel == Some(c.obj));
                     row.col(|ui| { ui.label(RichText::new((c.native_bytes + c.wrapper_bytes).to_string()).monospace()); });
                     row.col(|ui| { ui.label(RichText::new(c.inferred_bytes.to_string()).monospace()); });
-                    row.col(|ui| { ui.label(RichText::new(format!("{:.2}", c.infer_self_ms)).monospace()); });
+                    row.col(|ui| {
+                        let t = RichText::new(format!("{:.2}", c.infer_self_ms)).monospace();
+                        if c.bootstrap {
+                            ui.label(t.weak()).on_hover_text("valid since before the compiler's world: possibly inferred while the compiler bootstrapped itself (largely interpreted)");
+                        } else {
+                            ui.label(t);
+                        }
+                    });
                     row.col(|ui| { ui.label(&c.status); });
                     row.col(|ui| { ui.label(&c.invoke); });
                     row.col(|ui| {

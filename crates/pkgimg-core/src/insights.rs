@@ -183,7 +183,7 @@ fn piracy(w: &World, methods: &[MethodRow]) -> Option<Insight> {
 }
 
 /// Per-method aggregates of code instances: (count, native bytes, inference ms, label).
-fn ci_by_method(w: &World, cis: &[CiRow]) -> HashMap<Obj, (usize, u64, f32, String)> {
+fn ci_by_method<'a>(w: &World, cis: impl IntoIterator<Item = &'a CiRow>) -> HashMap<Obj, (usize, u64, f32, String)> {
     let mut by: HashMap<Obj, (usize, u64, f32, String)> = HashMap::new();
     for c in cis {
         let Some(d) = c.def else { continue };
@@ -259,10 +259,14 @@ fn native_concentration(w: &World, cis: &[CiRow]) -> Option<Insight> {
 }
 
 fn inference_time(w: &World, cis: &[CiRow]) -> Option<Insight> {
+    // In a system image, leave out code the compiler may have inferred while bootstrapping
+    // itself: it ran (partly) interpreted then, so those times say little about the code.
+    let (cis, boot): (Vec<&CiRow>, Vec<&CiRow>) = cis.iter().partition(|c| !c.bootstrap);
     let total: f32 = cis.iter().map(|c| c.infer_self_ms).sum();
     if total < 50.0 {
         return None;
     }
+    let boot_ms: f32 = boot.iter().map(|c| c.infer_self_ms).sum();
     let rows: Vec<_> = ci_by_method(w, cis).into_iter().filter(|r| r.1.2 > 0.0).collect();
     let (items, total_items) = top(rows, |r| r.1.2 as f64, |r, w| Item {
         label: r.1.3.clone(),
@@ -270,13 +274,27 @@ fn inference_time(w: &World, cis: &[CiRow]) -> Option<Insight> {
         weight: w,
         link: Link::Specializations { method: r.0, offset: r.0.off },
     });
+    let sys = w.target().heap.worlds;
     Some(Insight {
         kind: "inference-time",
         severity: if total >= 5000.0 { Severity::Notable } else { Severity::Info },
         title: "Most inference time".into(),
-        summary: format!("{:.1} s of inference recorded for code instances in this image", total / 1000.0),
-        detail: "Self inference time recorded during precompilation. It is paid again by every session that \
-                 needs code which is missing or invalidated.",
+        summary: match sys {
+            Some(wd) => format!(
+                "{:.1} s of inference recorded for code instances valid only after the compiler's world {} \
+                 (the {:.1} s in older ones, which includes the compiler bootstrapping itself, is left out)",
+                total / 1000.0, wd.typeinf_world, boot_ms / 1000.0,
+            ),
+            None => format!("{:.1} s of inference recorded for code instances in this image", total / 1000.0),
+        },
+        detail: if sys.is_some() {
+            "Self inference time recorded while building the system image. Code instances valid since \
+             before the compiler's world are left out: many were inferred while the compiler was \
+             bootstrapping itself and still largely interpreted, which inflates their times."
+        } else {
+            "Self inference time recorded during precompilation. It is paid again by every session that \
+             needs code which is missing or invalidated."
+        },
         items,
         total_items,
     })
@@ -424,8 +442,7 @@ pub fn insights(w: &World, objs: &[ObjEntry], cst: &[ObjEntry], methods: &[Metho
         piracy(w, methods),
         dead_code(cis),
         native_concentration(w, cis),
-        // Inference in a system image includes the compiler inferring itself while interpreted.
-        if w.target().header.pkg.is_none() { None } else { inference_time(w, cis) },
+        inference_time(w, cis),
         compiler_world(w, objs, cis),
         large_objects(w, objs, cst),
     ]

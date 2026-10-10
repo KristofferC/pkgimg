@@ -59,6 +59,10 @@ enum Cmd {
         /// Only code instances of methods owned by other packages.
         #[arg(long)]
         external: bool,
+        /// System images: leave out code instances valid since before the compiler's world, which
+        /// may have been inferred while the compiler bootstrapped itself (largely interpreted).
+        #[arg(long)]
+        no_bootstrap: bool,
     },
     /// Methods defined in the image.
     Methods { file: PathBuf },
@@ -328,7 +332,9 @@ fn main() -> Result<()> {
             let rows = heap_hist(&w, &objs, &cst, by, section);
             ctx.rows("heap", image_id(&w), &rows, &[("bytes", "bytes"), ("count", "count"), ("key", "type")], json!({}));
         }
-        Cmd::Compiled { by, sort, filter, sig, external, .. } => compiled(&ctx, &w, by, sort, filter, sig, external, cli.provenance.as_deref()),
+        Cmd::Compiled { by, sort, filter, sig, external, no_bootstrap, .. } => {
+            compiled(&ctx, &w, by, sort, filter, sig, external, no_bootstrap, cli.provenance.as_deref())
+        }
         Cmd::Asm { what, .. } => asm(&ctx, &w, &what)?,
         Cmd::Why { what, .. } => why(&ctx, &w, &what, cli.provenance.as_deref())?,
         Cmd::Methods { .. } => {
@@ -525,7 +531,7 @@ fn load_cis(w: &World, objs: &[ObjEntry], prov: Option<&std::path::Path>, need: 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>, sig: Option<String>, external: bool, prov: Option<&std::path::Path>) {
+fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>, sig: Option<String>, external: bool, no_bootstrap: bool, prov: Option<&std::path::Path>) {
     let (objs, _) = tables(w);
     let mut rows: Vec<CiRow> = load_cis(w, &objs, prov, matches!(by, CiBy::Root | CiBy::Parent));
     if let Some(f) = &filter {
@@ -537,10 +543,23 @@ fn compiled(ctx: &Ctx, w: &World, by: CiBy, sort: CiSort, filter: Option<String>
     if external {
         rows.retain(|r| r.external_method);
     }
+    if no_bootstrap {
+        rows.retain(|r| !r.bootstrap);
+    }
+    let boot_ms: f32 = rows.iter().filter(|r| r.bootstrap).map(|r| r.infer_self_ms).sum();
+    if sort == CiSort::InferTime && boot_ms > 0.0 && !ctx.json {
+        let total: f32 = rows.iter().map(|r| r.infer_self_ms).sum();
+        eprintln!(
+            "note: {:.1} s of the {:.1} s of inference is in code instances valid since before the compiler's world; \
+             many were inferred while the compiler bootstrapped itself (largely interpreted). Use --no-bootstrap to leave them out.",
+            boot_ms / 1000.0, total / 1000.0,
+        );
+    }
     let total_native: u64 = rows.iter().map(|r| r.native_total()).sum();
     let extra = json!({"totals": {"code_instances": rows.len(), "native_bytes": total_native,
         "clone_bytes": rows.iter().map(|r| r.clone_bytes).sum::<u64>(),
-        "inferred_bytes": rows.iter().map(|r| r.inferred_bytes).sum::<u64>()}});
+        "inferred_bytes": rows.iter().map(|r| r.inferred_bytes).sum::<u64>(),
+        "infer_self_ms": rows.iter().map(|r| r.infer_self_ms).sum::<f32>(), "bootstrap_infer_self_ms": boot_ms}});
     if by != CiBy::None {
         let labels = method_labels(w, &rows);
         let mut m: std::collections::HashMap<String, CiGroup> = Default::default();

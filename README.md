@@ -61,7 +61,10 @@ be passed to `show` (`--const` when true) or used to select a code instance with
 argument and callee types. When the callee type tells specializations apart (closures with
 captured types, `TypeEgal{T}` constructors), rows show `Mod.(::Callee)(args)` and carry it as
 `callee`. In a system image, `status` is `compiler-world` for code kept only for the world the
-compiler runs in (`summary` gives both worlds). Native sizes count one CPU target; `clone_bytes` and `summary` give the clones
+compiler runs in (`summary` gives both worlds), and `bootstrap` marks code valid since before
+that world, which may have been inferred while the compiler bootstrapped itself (largely
+interpreted) and so has inflated inference times; `--no-bootstrap` leaves it out and the
+inference-time insight ignores it. Native sizes count one CPU target; `clone_bytes` and `summary` give the clones
 compiled for the other targets of a multiversioned image.
 `methods` rows also give the extended function (`func`), whether another module owns it
 (`func_external`), possible piracy (`pirate`) and whether it is a keyword method

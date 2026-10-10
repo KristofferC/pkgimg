@@ -392,6 +392,10 @@ pub struct CiRow {
     pub clone_bytes: u64,
     pub infer_self_ms: f32,
     pub infer_total_ms: f32,
+    /// System images: valid since before the world the compiler runs in, so possibly inferred
+    /// while the compiler bootstrapped itself (largely interpreted), which inflates its
+    /// inference times.
+    pub bootstrap: bool,
     pub rettype: String,
     /// From the provenance sidecar: MethodInstance whose inference requested this one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -525,7 +529,8 @@ pub fn code_instances(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<CiRow> {
             obj: ci, mi, def, parent: None, root: None, method, module, file, line, spec, callee, owner, status,
             min_world: minw, max_world: maxw, external_method: ext,
             inferred_bytes, inferred, invoke, native_bytes, native_symbol, native_addr, wrapper_bytes, clone_bytes,
-            infer_self_ms: ms("time_infer_self"), infer_total_ms: ms("time_infer_total"), rettype,
+            infer_self_ms: ms("time_infer_self"), infer_total_ms: ms("time_infer_total"),
+            bootstrap: worlds.is_some_and(|wd| minw <= wd.typeinf_world), rettype,
         });
     }
     out
