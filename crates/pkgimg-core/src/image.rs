@@ -79,7 +79,7 @@ impl Image {
         let header = header::raw_sysimage_header(&uname, &arch);
         let heap_stored_size = emb.len();
         let data = maybe_decompress(emb.clone())?;
-        let heap = Heap::parse(data, false, header.base.cache_align())?;
+        let heap = Heap::parse(data, false, header.base.format_version, header.base.cache_align())?;
         let native = Some(native::parse(&bytes)?);
         Ok(Image { path: path.clone(), native_path: Some(path), header, ji: emb, heap, heap_stored_size, native, native_bytes: Some(bytes) })
     }
@@ -103,7 +103,7 @@ impl Image {
         };
         let heap_stored_size = stored.len();
         let data = maybe_decompress(stored)?;
-        let heap = Heap::parse(data, header.base.is_pkgimage(), header.base.cache_align())?;
+        let heap = Heap::parse(data, header.base.is_pkgimage(), header.base.format_version, header.base.cache_align())?;
         let native = match &native_buf {
             Some(n) => Some(native::parse(n)?),
             None => None,

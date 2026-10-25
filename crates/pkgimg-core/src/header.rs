@@ -135,8 +135,8 @@ fn read_module_list(c: &mut Cursor, has_hi: bool) -> Result<Vec<ModuleId>> {
     }
 }
 
-/// Header formats this reader understands: 16 (master), 12 (1.13).
-pub const SUPPORTED_FORMATS: &[u16] = &[12, 16];
+/// Header formats this reader understands: 17 (master), 16 (master before October 2026), 12 (1.13).
+pub const SUPPORTED_FORMATS: &[u16] = &[12, 16, 17];
 
 pub fn parse_base(buf: &[u8]) -> Result<(BaseHeader, usize)> {
     if !buf.starts_with(JI_MAGIC) {

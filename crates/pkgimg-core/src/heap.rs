@@ -86,6 +86,8 @@ pub struct Roots {
     pub restored: u64,
     pub init_order: u64,
     pub extext_methods: u64,
+    /// Format 17 and later: activation records, in parallel with `extext_methods`.
+    pub extext_records: Option<u64>,
     pub new_ext: u64,
     pub method_roots_list: u64,
 }
@@ -163,7 +165,7 @@ fn read_u32s(c: &mut Cursor) -> Result<Vec<u32>> {
 }
 
 impl Heap {
-    pub fn parse(data: Blob, incremental: bool, cache_align: usize) -> Result<Heap> {
+    pub fn parse(data: Blob, incremental: bool, format_version: u16, cache_align: usize) -> Result<Heap> {
         let buf: &[u8] = &data;
         let mut c = Cursor::new(buf, 0);
         // The object section is written with skip=8: its size word occupies the first 8
@@ -219,6 +221,7 @@ impl Heap {
                 restored: c.u64()?,
                 init_order: c.u64()?,
                 extext_methods: c.u64()?,
+                extext_records: if format_version >= 17 { Some(c.u64()?) } else { None },
                 new_ext: c.u64()?,
                 method_roots_list: c.u64()?,
             };
@@ -290,5 +293,25 @@ mod tests {
         let n = b.len();
         b[n - 8] = 1;
         assert_eq!(sys_worlds(&b), None);
+    }
+
+    #[test]
+    fn package_image_roots_follow_the_format_version() {
+        for (format_version, nroots) in [(16u16, 5u64), (17, 6)] {
+            let mut b = Vec::new();
+            for (align, len) in [(1, 0), (64, 0), (8, 0), (8, 36), (8, 0), (8, 0)] {
+                b.extend((len as u64).to_le_bytes());
+                b.resize(b.len().div_ceil(align) * align, 0);
+                b.extend(vec![0; len]);
+            }
+            b.extend((1..=nroots).flat_map(u64::to_le_bytes));
+            b.extend([0; 16]); // four empty link-id lists
+            b.extend(42u32.to_le_bytes()); // external_fns_begin
+            let h = Heap::parse(Blob::from_vec(b), true, format_version, 64).unwrap();
+            let r = h.roots.unwrap();
+            assert_eq!((r.extext_methods, r.new_ext, r.method_roots_list), (3, nroots - 1, nroots));
+            assert_eq!(r.extext_records, (format_version >= 17).then_some(4));
+            assert_eq!(h.external_fns_begin, 42);
+        }
     }
 }
