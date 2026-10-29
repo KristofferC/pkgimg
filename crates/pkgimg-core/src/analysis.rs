@@ -22,6 +22,8 @@ pub enum ConstLabel {
     FieldFlags,
     /// Out-of-line element data of a bits-type `GenericMemory` (`ty` is the memory's type).
     MemData,
+    /// GMP limbs of a `BigInt`, written out of line by the serializer.
+    BigIntLimbs,
 }
 
 /// All objects of the object section of `img`, in address order.
@@ -68,6 +70,9 @@ pub fn const_table(w: &World, img: ImgId, objs: &[ObjEntry]) -> Vec<ObjEntry> {
             Some(Kind::GenericMemory) => {
                 special.insert(e.obj.off + 8, ConstLabel::MemData);
                 owner.insert(e.obj.off + 8, e.ty);
+            }
+            Some(_) if e.ty.and_then(|t| w.datatype(t)).is_some_and(|t| t.qualified() == "Base.GMP.BigInt") => {
+                special.insert(e.obj.off + 8, ConstLabel::BigIntLimbs);
             }
             _ => {}
         }
@@ -120,6 +125,7 @@ pub fn type_key(w: &World, e: &ObjEntry, full: bool) -> String {
     match e.label {
         ConstLabel::Layout => return "<datatype layout>".into(),
         ConstLabel::FieldFlags => return "<field flags>".into(),
+        ConstLabel::BigIntLimbs => return "<bigint limbs>".into(),
         ConstLabel::Object | ConstLabel::MemData => {}
     }
     let Some(t) = e.ty else { return "<unknown>".into() };
@@ -577,10 +583,11 @@ pub fn slot_label(w: &World, e: &ObjEntry, pos: u32) -> String {
         _ => {}
     }
     if let Some(l) = &ti.layout {
-        for (i, f) in l.fields.iter().enumerate() {
-            if rel >= f.offset && rel < f.offset + f.size.max(8) {
-                return format!("{}.{}", ti.name, ti.field_names.get(i).map_or("?", |s| s.as_str()));
-            }
+        // Exact field first: small fields (`BigInt.size`) would otherwise claim the next slot.
+        let hit = l.fields.iter().position(|f| rel >= f.offset && rel < f.offset + f.size)
+            .or_else(|| l.fields.iter().position(|f| rel >= f.offset && rel < f.offset + f.size.max(8)));
+        if let Some(i) = hit {
+            return format!("{}.{}", ti.name, ti.field_names.get(i).map_or("?", |s| s.as_str()));
         }
     }
     format!("{}+{rel}", ti.name)

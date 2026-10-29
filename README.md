@@ -7,7 +7,7 @@ into the system image and dependency caches to name every type, method and speci
 - `pkgimg`: CLI with text or JSON output, for humans, scripts and agents
 - `pkgimg-gui`: egui desktop app and browser build
 
-Supported formats: Julia master (image format v16) and 1.13 (v12), 64-bit.
+Supported formats: Julia master (image format v17, and v16 from before October 2026) and 1.13 (v12), 64-bit.
 
 The GUI on the `Pkg` stdlib image from Julia 1.13.1:
 

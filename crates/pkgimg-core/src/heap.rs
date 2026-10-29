@@ -86,6 +86,8 @@ pub struct Roots {
     pub restored: u64,
     pub init_order: u64,
     pub extext_methods: u64,
+    /// Format 17+: `ext_backinterferences` records parallel to `extext_methods` (0 before).
+    pub extext_records: u64,
     pub new_ext: u64,
     pub method_roots_list: u64,
 }
@@ -163,7 +165,7 @@ fn read_u32s(c: &mut Cursor) -> Result<Vec<u32>> {
 }
 
 impl Heap {
-    pub fn parse(data: Blob, incremental: bool, cache_align: usize) -> Result<Heap> {
+    pub fn parse(data: Blob, incremental: bool, cache_align: usize, format_version: u16) -> Result<Heap> {
         let buf: &[u8] = &data;
         let mut c = Cursor::new(buf, 0);
         // The object section is written with skip=8: its size word occupies the first 8
@@ -219,6 +221,7 @@ impl Heap {
                 restored: c.u64()?,
                 init_order: c.u64()?,
                 extext_methods: c.u64()?,
+                extext_records: if format_version >= 17 { c.u64()? } else { 0 },
                 new_ext: c.u64()?,
                 method_roots_list: c.u64()?,
             };
@@ -277,6 +280,33 @@ impl Heap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn incremental_heap(nroots: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        for (align, len) in [(1, 0), (64, 0), (8, 0), (8, 36), (8, 0), (8, 0)] {
+            b.extend((len as u64).to_le_bytes());
+            b.resize(b.len().div_ceil(align) * align, 0);
+            b.resize(b.len() + len, 0);
+        }
+        for r in 1..=nroots {
+            b.extend((r * 8).to_le_bytes());
+        }
+        b.extend([0; 16]); // four empty link-id lists
+        b.extend(3u32.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn format_17_adds_the_extext_records_root() {
+        let h = Heap::parse(Blob::from_vec(incremental_heap(5)), true, 64, 16).unwrap();
+        let r = h.roots.unwrap();
+        assert_eq!((r.extext_methods, r.extext_records, r.new_ext, r.method_roots_list), (24, 0, 32, 40));
+        assert_eq!(h.external_fns_begin, 3);
+        let h = Heap::parse(Blob::from_vec(incremental_heap(6)), true, 64, 17).unwrap();
+        let r = h.roots.unwrap();
+        assert_eq!((r.extext_methods, r.extext_records, r.new_ext, r.method_roots_list), (24, 32, 40, 48));
+        assert_eq!(h.external_fns_begin, 3);
+    }
 
     #[test]
     fn system_image_worlds_are_read_from_the_tail() {
